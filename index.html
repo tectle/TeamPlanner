@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Local-time date fix)</title>
+    <title>Team — Plan Picker (Date fix + names on main)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
@@ -47,8 +47,8 @@
     <script type="text/babel" data-presets="env,react">
       const { useMemo, useState, useEffect } = React;
 
-      // ---------- Utilities (LOCAL TIME, no UTC ISO) ----------
-      const LS_KEY = "teamPlanner:nameKeyed:v5";
+      // ---------- Utilities (LOCAL TIME) ----------
+      const LS_KEY = "teamPlanner:nameKeyed:v6";
       const normalizeName = (s)=> (s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
       const setCookie = (name, value, days=365)=>{
         const d = new Date(); d.setTime(d.getTime()+days*24*60*60*1000);
@@ -67,21 +67,15 @@
       };
       const prefillFromQuery = ()=>{ const params = new URLSearchParams(window.location.search); const nm = params.get("name"); return nm ? nm.trim() : ""; };
 
-      // date helpers
       const MS = 60 * 1000;
-      const fmtDate = (d, tz) => new Date(typeof d === 'number' ? d : d).toLocaleDateString(undefined, { timeZone: tz, weekday:'short', month:'short', day:'numeric' });
-      const fmtTime = (d, tz) => new Date(typeof d === 'number' ? d : d).toLocaleTimeString(undefined, { timeZone: tz, hour:'numeric', minute:'2-digit' });
-      const labelHour = (h)=>{ if(h===24) return 'midnight'; const ampm=h<12?'am':'pm'; const hour12=((h+11)%12)+1; return hour12+ampm; };
+      const fmtDate = (ms, tz) => new Date(ms).toLocaleDateString(undefined, { timeZone: tz, weekday:'short', month:'short', day:'numeric' });
+      const fmtTime = (ms, tz) => new Date(ms).toLocaleTimeString(undefined, { timeZone: tz, hour:'numeric', minute:'2-digit' });
+      const labelHour = (h)=>{ const ampm=h<12?'am':'pm'; const hour12=((h+11)%12)+1; return hour12+ampm; };
 
-      // Return local midnight (ms) for YYYY-MM-DD (no UTC conversion)
-      function localStartOfDayMs(ymd){
-        const [y,m,d] = ymd.split('-').map(Number);
-        return new Date(y, m-1, d, 0,0,0,0).getTime();
-      }
+      function localStartOfDayMs(ymd){ const [y,m,d] = ymd.split('-').map(Number); return new Date(y, m-1, d, 0,0,0,0).getTime(); }
       const addMinutesMs = (ms, mins)=> ms + mins*60*1000;
       const addDaysMs = (ms, days)=> ms + days*24*60*60*1000;
 
-      // Slots use local ms and a stable local slotId (date|hour)
       function generateDailyHourRangeSlots(startDate,endDate,startHour,endHour){
         const days=[];
         const endStartMs = localStartOfDayMs(endDate);
@@ -92,7 +86,7 @@
           for(let h=startHour; h<endHour; h++){
             const startMs = addMinutesMs(dayStartMs, h*60);
             const endMs = addMinutesMs(startMs, 60);
-            const dateIsoLocal = new Date(dayStartMs).toISOString().slice(0,10); // only for id's date part
+            const dateIsoLocal = new Date(dayStartMs).toISOString().slice(0,10);
             const slotId = `${dateIsoLocal}|${h}`;
             slots.push({ id: slotId, startMs, endMs });
           }
@@ -102,20 +96,28 @@
         return days;
       }
 
-      function pickBestSlot(allSlots,availsBySlot){
-        if(!allSlots.length) return null;
-        const scored = allSlots.map(s=>{
-          const list = availsBySlot.get(s.id)||[];
-          const supporters = list.filter(a=> a.value==='yes' || a.value==='maybe').length;
-          return {...s, supporters, score: supporters};
-        });
-        const allZero = scored.every(x=>x.supporters===0);
-        if(allZero) return null;
-        scored.sort((a,b)=> b.supporters-a.supporters || (a.startMs - b.startMs));
-        return scored[0];
+      function pickBestSlotFromBuckets(buckets){
+        // buckets: Map<slotId, {yes[], maybe[], no[]}>
+        let bestId = null, bestSupporters = -1, bestSortKey = null;
+        const parseKey = (id)=>{
+          const [ymd,hStr] = id.split('|');
+          const hm = parseInt(hStr, 10);
+          return { ymd, h: hm };
+        };
+        for(const [slotId, bucket] of buckets.entries()){
+          const supporters = (bucket.yes?.length||0) + (bucket.maybe?.length||0);
+          const { ymd, h } = parseKey(slotId);
+          const sortKey = `${ymd}|${String(h).padStart(2,'0')}`;
+          if (supporters > bestSupporters || (supporters === bestSupporters && (!bestSortKey || sortKey < bestSortKey))) {
+            bestId = slotId;
+            bestSupporters = supporters;
+            bestSortKey = sortKey;
+          }
+        }
+        if (!bestId) return null;
+        return { slotId: bestId, supporters: bestSupporters };
       }
 
-      function Pill({children}){ return <span className="px-2 py-1 rounded-full text-xs border">{children}</span>; }
       function SegmentedVote({value, onChange, disabled}){
         const base="tap text-[13px] px-2 py-1 rounded-md border " + (disabled ? "opacity-50 cursor-not-allowed" : "hover:bg-gray-50");
         return (<div className="inline-flex gap-1">
@@ -150,46 +152,47 @@
 
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
         const now = new Date();
-        const nextSat = React.useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
-        const nextSun = React.useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
+        const nextSat = useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
+        const nextSun = useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
         const toYMD = (d)=> `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
         // Name profile
-        const [userName,setUserName]=React.useState('');
-        const [isEditingUser,setIsEditingUser]=React.useState(true);
-        const [uid,setUid]=React.useState(null);
+        const [userName,setUserName]=useState('');
+        const [isEditingUser,setIsEditingUser]=useState(true);
+        const [uid,setUid]=useState(null);
 
         // Create form
-        const [title,setTitle]=React.useState('');
-        const [description,setDescription]=React.useState('');
-        const [startDate,setStartDate]=React.useState(toYMD(nextSat));
-        const [endDate,setEndDate]=React.useState(toYMD(nextSun));
-        const [startHour,setStartHour]=React.useState(8);
-        const [endHour,setEndHour]=React.useState(24);
-        const [mode,setMode]=React.useState('poll');
-        const [endTouched,setEndTouched]=React.useState(false);
+        const [title,setTitle]=useState('');
+        const [description,setDescription]=useState('');
+        const [startDate,setStartDate]=useState(toYMD(nextSat));
+        const [endDate,setEndDate]=useState(toYMD(nextSun));
+        const [startHour,setStartHour]=useState(8);
+        const [endHour,setEndHour]=useState(23); // default 11pm
+        const [mode,setMode]=useState('poll');
+        const [endTouched,setEndTouched]=useState(false);
 
         // Data
-        const [events,setEvents]=React.useState([]);
-        const [selectedId,setSelectedId]=React.useState(null);
-        const [yourVotes,setYourVotes]=React.useState(new Map());
+        const [events,setEvents]=useState([]);
+        const [selectedId,setSelectedId]=useState(null);
+        const [yourVotes,setYourVotes]=useState(new Map());
 
-        const [namesBySlot,setNamesBySlot]=React.useState(new Map());
-        const [attendingMap,setAttendingMap]=React.useState({});
-        const [hoverState,setHoverState]=React.useState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} });
+        const [namesBySlotSelected,setNamesBySlotSelected]=useState(new Map());
+        const [attendingMap,setAttendingMap]=useState({});
+        const [pollBestMap,setPollBestMap]=useState({}); // { [eventId]: {slotId, supporters, names[], dayMs, hour} }
+        const [hoverState,setHoverState]=useState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} });
 
         // Prefill name
-        React.useEffect(()=>{
+        useEffect(()=>{
           const prof = loadProfile();
           const qName = prefillFromQuery();
           const initialName = qName || (prof?.userName || '');
           setUserName(initialName);
           setIsEditingUser(!(initialName && initialName.trim()));
         },[]);
-        React.useEffect(()=>{ saveProfile({ userName }); },[userName]);
+        useEffect(()=>{ saveProfile({ userName }); },[userName]);
 
         // Anonymous auth
-        React.useEffect(()=>{
+        useEffect(()=>{
           if (!auth) return;
           const unsub = onAuthStateChanged(auth, async (u) => {
             if (u) setUid(u.uid);
@@ -202,7 +205,7 @@
         },[auth]);
 
         // Live events
-        React.useEffect(()=>{
+        useEffect(()=>{
           if(!db) return;
           const q = query(collection(db, "team_events"), orderBy("createdAt","asc"));
           const unsub = onSnapshot(q, (snap)=>{
@@ -212,22 +215,41 @@
           return unsub;
         },[db]);
 
-        // Per-event fixed attending summaries
-        React.useEffect(()=>{
+        // Per-event votes (for fixed attending + poll best names on main page)
+        useEffect(()=>{
           if(!db) return;
           const unsubs = [];
           events.forEach(ev => {
             const votesRef = collection(doc(db, "team_events", ev.id), "votes");
             const u = onSnapshot(votesRef, (snap)=>{
               let yes=0; const namesYes=[];
+              const slotBuckets = new Map(); // slotId -> {yes[], maybe[], no[]}
               snap.forEach(s=>{
                 const v = s.data();
-                if (s.id.startsWith("fixed::") && v.value === 'yes') {
-                  yes += 1;
-                  namesYes.push(v.userName || 'Anonymous');
+                if (s.id.startsWith("fixed::")) {
+                  if (v.value === 'yes') { yes += 1; namesYes.push(v.userName || 'Anonymous'); }
+                } else if (v.slotId) {
+                  const b = slotBuckets.get(v.slotId) || { yes:[], maybe:[], no:[] };
+                  const nm = v.userName || 'Anonymous';
+                  if (v.value==='yes') b.yes.push(nm);
+                  else if (v.value==='maybe') b.maybe.push(nm);
+                  else if (v.value==='no') b.no.push(nm);
+                  slotBuckets.set(v.slotId, b);
                 }
               });
+              // Fixed summaries
               setAttendingMap(prev => ({ ...prev, [ev.id]: { yes, namesYes } }));
+              // Poll best summaries (names for best slot)
+              if (ev.mode === 'poll') {
+                const best = pickBestSlotFromBuckets(slotBuckets);
+                if (best) {
+                  const bucket = slotBuckets.get(best.slotId) || { yes:[], maybe:[], no:[] };
+                  const names = [...bucket.yes, ...bucket.maybe];
+                  setPollBestMap(prev => ({ ...prev, [ev.id]: { slotId: best.slotId, supporters: best.supporters, names } }));
+                } else {
+                  setPollBestMap(prev => ({ ...prev, [ev.id]: null }));
+                }
+              }
             });
             unsubs.push(u);
           });
@@ -235,7 +257,7 @@
         },[db, events]);
 
         // Selected event votes (for hover + current values)
-        React.useEffect(()=>{
+        useEffect(()=>{
           if(!db || !selectedId) return;
           const votesRef = collection(doc(db, "team_events", selectedId), "votes");
           const unsub = onSnapshot(votesRef, (snap)=>{
@@ -254,7 +276,7 @@
               }
             });
             setYourVotes(mapValues);
-            setNamesBySlot(mapNames);
+            setNamesBySlotSelected(mapNames);
           });
           return ()=>unsub && unsub();
         },[db, selectedId]);
@@ -301,7 +323,7 @@
             }
           }
 
-          setTitle(''); setDescription(''); setStartHour(8); setEndHour(24); setMode('poll'); setEndTouched(false);
+          setTitle(''); setDescription(''); setStartHour(8); setEndHour(23); setMode('poll'); setEndTouched(false);
         }
 
         async function setVoteForEvent(evId, value, meta){
@@ -333,46 +355,27 @@
           }
         }
 
-        const dayGroups = React.useMemo(()=>{
+        // For selected event, build day groups using local time
+        const dayGroups = useMemo(()=>{
           if(!selected || selected.mode==='fixed') return [];
           const sHour = selected.startHour ?? 8;
-          const eHour = selected.endHour ?? 24;
+          const eHour = selected.endHour ?? 23;
           return generateDailyHourRangeSlots(selected.startDate, selected.endDate, sHour, eHour);
         },[selected]);
-        const allSlots = React.useMemo(()=> dayGroups.flatMap(g=>g.slots), [dayGroups]);
-
-        const availsBySlot = React.useMemo(()=>{
-          const map = new Map();
-          allSlots.forEach(s=>map.set(s.id, []));
-          if(selected){
-            namesBySlot.forEach((bucket, slotId)=>{
-              const arr = [];
-              bucket.yes.forEach(n => arr.push({slotId, participantName:n, value:'yes'}));
-              bucket.maybe.forEach(n => arr.push({slotId, participantName:n, value:'maybe'}));
-              bucket.no.forEach(n => arr.push({slotId, participantName:n, value:'no'}));
-              map.set(slotId, arr);
-            });
-          }
-          return map;
-        },[allSlots, namesBySlot, selected]);
-
-        const best = React.useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
 
         function currentFixedValue(){ return yourVotes.get(`fixed::${normalizeName(userName)}`); }
         function currentPollValue(slotId){ return yourVotes.get(`${normalizeName(userName)}::${slotId}`); }
 
         function openHover(e, slotId){
           const rect = e.currentTarget.getBoundingClientRect();
-          const bucket = namesBySlot.get(slotId) || { yes:[], maybe:[], no:[] };
+          const bucket = namesBySlotSelected.get(slotId) || { yes:[], maybe:[], no:[] };
           setHoverState({ visible:true, rect, names: bucket });
         }
         function closeHover(){ setHoverState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} }); }
 
         function summaryForEvent(ev){
           const att = attendingMap[ev.id];
-          const sHour = ev.startHour ?? 8;
-          const eHour = ev.endHour ?? 24;
-          const timeLabel = `${labelHour(sHour)}–${labelHour(eHour)}`;
+          const timeLabel = `${labelHour(ev.startHour ?? 8)}–${labelHour(ev.endHour ?? 23)}`;
           if(ev.mode==='fixed'){
             if(att) {
               const names = att.namesYes || [];
@@ -382,18 +385,8 @@
             }
             return { type:'fixed', yes: 0, label: '', timeLabel };
           } else {
-            const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, eHour).flatMap(g=>g.slots);
-            const map = new Map();
-            slots.forEach(s=>map.set(s.id, []));
-            namesBySlot.forEach((bucket, slotId)=>{
-              const arr = [];
-              bucket.yes.forEach(n => arr.push({slotId, participantName:n, value:'yes'}));
-              bucket.maybe.forEach(n => arr.push({slotId, participantName:n, value:'maybe'}));
-              bucket.no.forEach(n => arr.push({slotId, participantName:n, value:'no'}));
-              map.set(slotId, arr);
-            });
-            const b = pickBestSlot(slots, map);
-            return { type:'poll', best: b, timeLabel };
+            const best = pollBestMap[ev.id];
+            return { type:'poll', best, timeLabel };
           }
         }
 
@@ -444,8 +437,8 @@
                 endHour={endHour}
                 setTitle={setTitle}
                 setDescription={setDescription}
-                setStartDate={val=>{ setStartDate(val); if(!endTouched) setEndDate(val); }}
-                setEndDate={val=>{ setEndDate(val); setEndTouched(true); }}
+                setStartDate={(v)=>{ setStartDate(v); if(!endTouched) setEndDate(v); }}
+                setEndDate={(v)=>{ setEndDate(v); setEndTouched(true); }}
                 setStartHour={setStartHour}
                 setEndHour={setEndHour}
                 mode={mode}
@@ -459,14 +452,12 @@
                 tz={tz}
                 event={selected}
                 dayGroups={dayGroups}
-                yourVotes={yourVotes}
-                best={best}
                 currentFixedValue={()=>yourVotes.get(`fixed::${normalizeName(userName)}`)}
                 currentPollValue={(slotId)=>yourVotes.get(`${normalizeName(userName)}::${slotId}`)}
                 setVote={(val, meta)=>setVoteForEvent(selected.id, val, meta)}
                 openHover={openHover}
                 closeHover={closeHover}
-                namesBySlot={namesBySlot}
+                namesBySlot={namesBySlotSelected}
                 canAct={canAct}
                 onBack={()=>setSelectedId(null)}
               />
@@ -485,6 +476,8 @@
           canAct
         } = props;
 
+        function Pill({children}){ return <span className="px-2 py-1 rounded-full text-xs border">{children}</span>; }
+
         return (
           <div className="space-y-8">
             <section className="bg-white rounded-2xl shadow p-4">
@@ -493,7 +486,7 @@
                 <ul className="divide-y">
                   {events.map(ev => {
                     const summary = summaryForEvent(ev);
-                    const timeLabel = summary.timeLabel || `${labelHour(ev.startHour ?? 8)}–${labelHour(ev.endHour ?? 24)}`;
+                    const timeLabel = summary.timeLabel || `${labelHour(ev.startHour ?? 8)}–${labelHour(ev.endHour ?? 23)}`;
                     return (
                       <li key={ev.id} className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                         <div className="text-sm">
@@ -504,16 +497,32 @@
                             </span>
                           </div>
                           {ev.description ? <div className="text-[12px] text-gray-600 mt-0.5">{ev.description}</div> : null}
-                          <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} · {timeLabel}</div>
+                          <div className="text-gray-500">{fmtDate(localStartOfDayMs(ev.startDate), tz)} → {fmtDate(localStartOfDayMs(ev.endDate), tz)} · {timeLabel}</div>
 
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
                               <b>Attending:</b> {summary.yes} {summary.yes===1?'person':'people'}{summary.label ? ` · ${summary.label}` : ''}
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
-                            <div className="text:[12px] mt-1">
-                              <b>Top candidate:</b> {fmtDate(summary.best.startMs, tz)} · {fmtTime(summary.best.startMs, tz)} ·
-                              <span className="ml-1">Supporters: {summary.best.supporters}</span>
+                            <div className="text-[12px] mt-1 flex flex-wrap items-center gap-1">
+                              <b>Top candidate:</b>
+                              <span>{/* We'll print date/time from slotId */}
+                                {(() => {
+                                  const [ymd,hStr] = summary.best.slotId.split('|');
+                                  const ms = localStartOfDayMs(ymd) + parseInt(hStr,10)*60*60*1000;
+                                  return `${fmtDate(ms, tz)} · ${fmtTime(ms, tz)}`;
+                                })()}
+                              </span>
+                              <span>·</span>
+                              <span>Supporters:</span>
+                              <Pill>
+                                {(() => {
+                                  const names = summary.best.names || [];
+                                  const shown = names.slice(0, 6).join(', ');
+                                  const extra = Math.max(0, names.length - 6);
+                                  return `${shown}${extra ? ` +${extra} more` : ''} ${names.length ? `(${names.length})` : '(0)'}`;
+                                })()}
+                              </Pill>
                             </div>
                           ) : null}
                         </div>
@@ -544,11 +553,11 @@
 
                 <label className="flex flex-col gap-1 sm:col-span-4">
                   <span className="text-sm text-gray-700">Start date</span>
-                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startDate} onChange={e=>handleStartDateChange(e.target.value)} required/>
+                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startDate} onChange={e=>setStartDate(e.target.value)} required/>
                 </label>
                 <label className="flex flex-col gap-1 sm:col-span-4">
                   <span className="text-sm text-gray-700">End date</span>
-                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endDate} onChange={e=>handleEndDateChange(e.target.value)} required/>
+                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endDate} onChange={e=>setEndDate(e.target.value)} required/>
                 </label>
 
                 <label className="flex flex-col gap-1 sm:col-span-2">
@@ -560,7 +569,7 @@
                 <label className="flex flex-col gap-1 sm:col-span-2">
                   <span className="text-sm text-gray-700">End time</span>
                   <select className="tap border rounded-md px-2 py-1 text-sm w-full" value={endHour} onChange={e=>setEndHour(parseInt(e.target.value))}>
-                    {Array.from({length:25},(_,h)=>h).map(h=><option key={h} value={h}>{labelHour(h)}</option>)}
+                    {Array.from({length:24},(_,h)=>h).map(h=><option key={h} value={h}>{labelHour(h)}</option>)}
                   </select>
                 </label>
 
@@ -581,22 +590,15 @@
         );
       }
 
-      function EventDetail({ tz, event, dayGroups, yourVotes, best, currentFixedValue, currentPollValue, setVote, openHover, closeHover, namesBySlot, canAct, onBack }){
+      function EventDetail({ tz, event, dayGroups, currentFixedValue, currentPollValue, setVote, openHover, closeHover, namesBySlot, canAct, onBack }){
         const isFixed = event.mode === 'fixed';
-        const timeLabel = `${labelHour(event.startHour ?? 8)}–${labelHour(event.endHour ?? 24)}`;
+        const timeLabel = `${labelHour(event.startHour ?? 8)}–${labelHour(event.endHour ?? 23)}`;
 
         // Helper for rendering name list with "+N more"
         function NameList({ names, max=6 }){
           const shown = names.slice(0, max);
           const extra = Math.max(0, names.length - shown.length);
-          return <span>{shown.join(', ')}{extra ? ` +${extra} more` : ''}</span>;
-        }
-
-        // Build the names for the best slot (yes+maybe)
-        let bestNames = [];
-        if (best && namesBySlot) {
-          const bucket = namesBySlot.get(best.id) || { yes:[], maybe:[], no:[] };
-          bestNames = [...(bucket.yes||[]), ...(bucket.maybe||[])];
+          return <span>{shown.join(', ')}{extra ? ` +${extra} more` : ''} {names.length ? `(${names.length})` : '(0)'}</span>;
         }
 
         return (
@@ -610,7 +612,7 @@
                   </span>
                 </h2>
                 {event.description ? <div className="text-[12px] text-gray-600 mt-0.5">{event.description}</div> : null}
-                <div className="text-xs text-gray-500">Dates: <b>{fmtDate(event.startDate, tz)}</b> → <b>{fmtDate(event.endDate, tz)}</b> · {timeLabel}</div>
+                <div className="text-xs text-gray-500">Dates: <b>{fmtDate(localStartOfDayMs(event.startDate), tz)}</b> → <b>{fmtDate(localStartOfDayMs(event.endDate), tz)}</b> · {timeLabel}</div>
                 <div className="text-xs text-gray-500">Hosted by: <b>{event.organizer || '—'}</b></div>
               </div>
               <button onClick={onBack} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">← Back</button>
@@ -652,26 +654,38 @@
             {!isFixed && (
               <section className="bg-white rounded-2xl shadow p-4">
                 <h3 className="text-lg font-semibold mb-2">Top candidate</h3>
-                {best ? (
-                  <div className="flex flex-col gap-1 text-sm">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span>Time:</span>
-                      <Pill>{fmtDate(best.startMs, tz)} · {fmtTime(best.startMs, tz)}</Pill>
+                {(() => {
+                  // compute best from namesBySlot (selected event)
+                  const best = (()=>{
+                    let bId=null, bSup=-1, bKey=null;
+                    for (const [slotId, bucket] of namesBySlot.entries()){
+                      const supporters = (bucket.yes?.length||0) + (bucket.maybe?.length||0);
+                      const [ymd,hStr] = slotId.split('|'); const key = `${ymd}|${String(parseInt(hStr,10)).padStart(2,'0')}`;
+                      if (supporters > bSup || (supporters===bSup && (!bKey || key < bKey))) { bId=slotId; bSup=supporters; bKey=key; }
+                    }
+                    if(!bId) return null;
+                    return { slotId:bId, supporters:bSup };
+                  })();
+                  if (!best) return <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>;
+                  const [ymd,hStr] = best.slotId.split('|');
+                  const ms = localStartOfDayMs(ymd) + parseInt(hStr,10)*60*60*1000;
+                  const bucket = namesBySlot.get(best.slotId) || { yes:[], maybe:[], no:[] };
+                  const names = [...(bucket.yes||[]), ...(bucket.maybe||[])];
+                  return (
+                    <div className="flex flex-col gap-1 text-sm">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>Time:</span>
+                        <span className="px-2 py-1 rounded-full text-xs border">{fmtDate(ms, tz)} · {fmtTime(ms, tz)}</span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>Supporters:</span>
+                        <span className="px-2 py-1 rounded-full text-xs border">
+                          {names.slice(0,6).join(', ')}{names.length>6? ` +${names.length-6} more` : ''} {names.length?`(${names.length})`:'(0)'}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span>Supporters:</span>
-                      {(() => {
-                        const bucket = namesBySlot.get(best.id) || { yes:[], maybe:[], no:[] };
-                        const names = [...(bucket.yes||[]), ...(bucket.maybe||[])];
-                        const shown = names.slice(0, 6).join(', ');
-                        const extra = Math.max(0, names.length - 6);
-                        return <Pill>{shown}{extra ? ` +${extra} more` : ''} {names.length ? `(${names.length})` : '(0)'}</Pill>;
-                      })()}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>
-                )}
+                  );
+                })()}
                 <div className="mt-3 text-xs text-gray-500">Tie‑breaker: most supporters → earliest.</div>
               </section>
             )}
