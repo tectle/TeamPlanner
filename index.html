@@ -76,31 +76,49 @@
       const addMinutesMs = (ms, mins)=> ms + mins*60*1000;
       const addDaysMs = (ms, days)=> ms + days*24*60*60*1000;
 
+      
       function generateDailyHourRangeSlots(startDate,endDate,startHour,endHour){
         const days = [];
         const startMsDay = localStartOfDayMs(startDate);
         const endMsDay   = localStartOfDayMs(endDate);
         let curMs = startMsDay;
+        const same = startHour === endHour;
+        const overnight = startHour > endHour;
+
         while (curMs <= endMsDay) {
-          const isFirst = curMs === startMsDay;
-          const isLast  = curMs === endMsDay;
-          let hStart, hEnd;
-          if (startMsDay === endMsDay) { hStart = startHour; hEnd = endHour; }
-          else if (isFirst) { hStart = startHour; hEnd = 24; }
-          else if (isLast)  { hStart = 0;         hEnd = endHour; }
-          else { hStart = 0; hEnd = 24; }
           const slots = [];
-          for (let h = hStart; h < hEnd; h++) {
-            const sMs = addMinutesMs(curMs, h * 60);
+          if (same) {
+            const sMs = addMinutesMs(curMs, startHour * 60);
             const eMs = addMinutesMs(sMs, 60);
             const ymd = new Date(curMs).toISOString().slice(0,10);
-            slots.push({ id: `${ymd}|${h}`, startMs: sMs, endMs: eMs });
+            slots.push({ id: `${ymd}|${startHour}`, startMs: sMs, endMs: eMs });
+          } else if (!overnight) {
+            for (let h = startHour; h < endHour; h++) {
+              const sMs = addMinutesMs(curMs, h * 60);
+              const eMs = addMinutesMs(sMs, 60);
+              const ymd = new Date(curMs).toISOString().slice(0,10);
+              slots.push({ id: `${ymd}|${h}`, startMs: sMs, endMs: eMs });
+            }
+          } else {
+            for (let h = startHour; h < 24; h++) {
+              const sMs = addMinutesMs(curMs, h * 60);
+              const eMs = addMinutesMs(sMs, 60);
+              const ymd = new Date(curMs).toISOString().slice(0,10);
+              slots.push({ id: `${ymd}|${h}`, startMs: sMs, endMs: eMs });
+            }
+            for (let h = 0; h < endHour; h++) {
+              const sMs = addMinutesMs(curMs, h * 60);
+              const eMs = addMinutesMs(sMs, 60);
+              const ymd = new Date(curMs).toISOString().slice(0,10);
+              slots.push({ id: `${ymd}|${h}`, startMs: sMs, endMs: eMs });
+            }
           }
           days.push({ dayKey: new Date(curMs).toDateString(), dayStartMs: curMs, slots });
           curMs = addDaysMs(curMs, 1);
         }
         return days;
       }
+    
 
       function pickBestSlotFromBuckets(buckets){
         // buckets: Map<slotId, {yes[], maybe[], no[]}>
@@ -220,7 +238,19 @@
             setEvents(list);
           });
           return unsub;
-        },[db]);
+        },[db])
+        useEffect(()=>{
+          if (editTarget){
+            setTitle(editTarget.title || '');
+            setDescription(editTarget.description || '');
+            setStartDate(editTarget.startDate);
+            setEndDate(editTarget.endDate);
+            setStartHour(editTarget.startHour ?? 8);
+            setEndHour(editTarget.endHour ?? 23);
+            setMode(editTarget.mode || 'poll');
+          }
+        },[editTarget]);
+    ;
 
         // Per-event votes (for fixed attending + poll best names on main page)
         useEffect(()=>{
@@ -304,7 +334,11 @@
           if(start>end){ alert('Start date must be before end date.'); return; }
           const startMs = localStartOfDayMs(startDate) + startHour * 60 * 60 * 1000;
           const endMs   = localStartOfDayMs(endDate)   + endHour   * 60 * 60 * 1000;
-          if (endMs <= startMs) { alert("End time must be after start time (end date/time must be after start date/time)."); return; }
+          const isPoll = mode === 'poll';
+          if (endMs < startMs || (!isPoll && endMs === startMs)) {
+            alert("End time must be after start time (for fixed events). In Find a time, equal start/end is allowed.");
+            return;
+          }
           const ev={
             title: title.trim(),
             description: description.trim(),
@@ -576,7 +610,7 @@
                         </div>
                         <div className="flex items-center gap-2">
                           <button onClick={()=>onSelect(ev.id)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
-                          <button onClick={()=>onStartEdit(ev)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-blue-50 text-blue-700 hover:bg-blue-100">Edit</button><button onClick={()=>onDelete(ev)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
+                          <button onClick={()=>{ onStartEdit(ev); window.scrollTo(0,0); }} className="tap text-sm px-3 py-1.5 rounded-lg border bg-blue-50 text-blue-700 hover:bg-blue-100">Edit</button><button onClick={()=>onDelete(ev)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
                         </div>
                       </li>
                     );
