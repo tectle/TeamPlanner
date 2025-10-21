@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Single File, No TS)</title>
+    <title>Team — Plan Picker (Persistent, Fixed RSVP + Summaries)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
@@ -16,6 +16,39 @@
 
     <script type="text/babel" data-presets="env,react">
       const { useMemo, useState, useRef, useEffect } = React;
+
+      // ----- persistence helpers -----
+      const LS_KEY = "teamPlanner:v3"; // bump version for new behavior
+      const nowISO = () => new Date().toISOString();
+
+      function saveToLS(state){
+        try {
+          const toStore = {
+            v: 3,
+            savedAt: nowISO(),
+            userName: state.userName,
+            events: state.events,
+            selectedId: state.selectedId,
+            votes: Array.from(state.yourVotes.entries()), // [slotId, vote]
+          };
+          localStorage.setItem(LS_KEY, JSON.stringify(toStore));
+        } catch (e) { console.warn("saveToLS failed", e); }
+      }
+      function loadFromLS(){
+        try {
+          const raw = localStorage.getItem(LS_KEY);
+          if(!raw) return null;
+          const data = JSON.parse(raw);
+          if(!data || typeof data !== "object") return null;
+          if((data.v !== 2 && data.v !== 3) || !Array.isArray(data.events) || !Array.isArray(data.votes)) return null;
+          return {
+            userName: data.userName || "",
+            events: data.events || [],
+            selectedId: data.selectedId || null,
+            yourVotes: new Map(data.votes),
+          };
+        } catch (e) { console.warn("loadFromLS failed", e); return null; }
+      }
 
       // ----- utils -----
       const MS = 60 * 1000;
@@ -52,6 +85,9 @@
         return scored[0];
       }
 
+      // Special slot id for fixed events RSVP
+      const fixedSlotId = (eventId)=> `fixed::${eventId}`;
+
       // ----- UI bits -----
       function Pill({children}){ return <span className="px-2 py-0.5 rounded-full text-xs border">{children}</span>; }
       function SegmentedVote({value, onChange, onHoverNames}){
@@ -76,64 +112,131 @@
       // ----- Main App -----
       function App(){
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        const loaded = loadFromLS();
+
         const now = new Date();
         const nextSat = useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
         const nextSun = useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
         const toYMD = (d)=> `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
-        const [userName,setUserName]=useState('');
-        const [isEditingUser,setIsEditingUser]=useState(true);
-        const [events,setEvents]=useState([]);
-        const [selectedId,setSelectedId]=useState(null);
+        const [userName,setUserName]=useState(loaded?.userName ?? '');
+        const [isEditingUser,setIsEditingUser]=useState(!loaded?.userName);
+        const [events,setEvents]=useState(loaded?.events ?? []);
+        const [selectedId,setSelectedId]=useState(loaded?.selectedId ?? null);
 
         const [title,setTitle]=useState('');
         const [startDate,setStartDate]=useState(toYMD(nextSat));
         const [endDate,setEndDate]=useState(toYMD(nextSun));
         const [allTime,setAllTime]=useState(false);
         const [startHour,setStartHour]=useState(8);
+        const [mode,setMode]=useState('poll'); // 'poll' | 'fixed'
+        const [endTouched,setEndTouched]=useState(false);
 
-        const [yourVotes,setYourVotes]=useState(()=>new Map());
+        const [yourVotes,setYourVotes]=useState(()=> loaded?.yourVotes ?? new Map());
         const [confirmDeleteId,setConfirmDeleteId]=useState(null);
         const confirmEvent = events.find(e=>e.id===confirmDeleteId)||null;
         const selected = events.find(e=>e.id===selectedId)||null;
 
+        // Create slots for a given event (for summary/best)
+        const eventSlots = React.useCallback((ev)=>{
+          const sHour = ev.allTime?0:(ev.startHour ?? 8);
+          return generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
+        },[]);
+
+        // derive day grid for selected
         const dayGroups = useMemo(()=>{
-          if(!selected) return [];
+          if(!selected || selected.mode==='fixed') return [];
           const sHour = selected.allTime?0:(selected.startHour ?? 8);
           return generateDailyHourRangeSlots(selected.startDate, selected.endDate, sHour, 24);
         },[selected]);
-
         const allSlots = useMemo(()=> dayGroups.flatMap(g=>g.slots), [dayGroups]);
 
+        // availability map: user's votes + special fixed RSVP
         const availsBySlot = useMemo(()=>{
           const map = new Map();
+          // include poll slots if any
           allSlots.forEach(s=>map.set(s.id, []));
+          // include fixed special slot when selected is fixed
+          if(selected && selected.mode==='fixed'){
+            map.set(fixedSlotId(selected.id), []);
+          }
           yourVotes.forEach((v,slotId)=>{
-            const arr = map.get(slotId)||[];
+            const arr = map.get(slotId) || [];
             arr.push({slotId, participantName: userName || 'You', value: v, weight: 1});
             map.set(slotId, arr);
           });
           return map;
-        },[allSlots, yourVotes, userName]);
+        },[allSlots, yourVotes, userName, selected]);
 
         const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots,availsBySlot]);
-
         const [hoverInfo,setHoverInfo]=useState({visible:false, names:{yes:[], maybe:[], no:[]}});
         const hoverAnchor = useRef(null);
+
+        // Auto end date follows start date until end edited
+        function handleStartDateChange(val){
+          setStartDate(val);
+          if(!endTouched) setEndDate(val);
+        }
+        function handleEndDateChange(val){
+          setEndDate(val);
+          setEndTouched(true);
+        }
 
         function createEvent(e){
           e.preventDefault();
           if(!title.trim()) return;
           const start=new Date(startDate), end=new Date(endDate);
           if(start>end){ alert('Start date must be before end date.'); return; }
-          const ev={ id: (crypto.randomUUID?.()||String(Math.random())), title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You' };
+          const ev={ id: (crypto.randomUUID?.()||String(Math.random())), title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You', mode };
           setEvents(p=>[...p, ev]);
-          setTitle(''); setAllTime(false); setStartHour(8);
+          setTitle(''); setAllTime(false); setStartHour(8); setMode('poll'); setEndTouched(false);
         }
         function setVote(slotId, v){ setYourVotes(p=> new Map(p).set(slotId, v)); }
         function requestDelete(id){ setConfirmDeleteId(id); }
         function performDelete(){ if(!confirmDeleteId) return; setEvents(p=>p.filter(e=>e.id!==confirmDeleteId)); if(selectedId===confirmDeleteId) setSelectedId(null); setConfirmDeleteId(null); }
         function cancelDelete(){ setConfirmDeleteId(null); }
+
+        // ---- Persist whenever key state changes (debounced) ----
+        const saveDebounceRef = useRef(null);
+        function scheduleSave(){
+          if(saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+          saveDebounceRef.current = setTimeout(()=>{
+            saveToLS({ userName, events, selectedId, yourVotes });
+          }, 200);
+        }
+        useEffect(scheduleSave, [userName, events, selectedId, yourVotes]);
+
+        // ---- Main page summaries ----
+        function summaryForEvent(ev){
+          if(ev.mode==='fixed'){
+            const fid = fixedSlotId(ev.id);
+            const v = yourVotes.get(fid);
+            const yes = v==='yes' ? 1 : 0;
+            const maybe = v==='maybe' ? 1 : 0;
+            const no = v==='no' ? 1 : 0;
+            const names = {
+              yes: v==='yes' ? [userName || 'You'] : [],
+              maybe: v==='maybe' ? [userName || 'You'] : [],
+              no: v==='no' ? [userName || 'You'] : [],
+            };
+            return { type:'fixed', yes, maybe, no, names };
+          } else { // poll
+            const slots = eventSlots(ev);
+            if(!slots.length) return { type:'poll', best:null };
+            // Build per-event map from votes (one-user for now)
+            const map = new Map();
+            slots.forEach(s=>map.set(s.id, []));
+            yourVotes.forEach((v,slotId)=>{
+              if(map.has(slotId)){
+                const arr = map.get(slotId);
+                arr.push({slotId, participantName: userName || 'You', value: v});
+                map.set(slotId, arr);
+              }
+            });
+            const best = pickBestSlot(slots, map);
+            return { type:'poll', best };
+          }
+        }
 
         return (
           <div className="bg-white min-h-screen p-6 max-w-7xl mx-auto font-sans">
@@ -166,11 +269,14 @@
                 allTime={allTime}
                 startHour={startHour}
                 setTitle={setTitle}
-                setStartDate={setStartDate}
-                setEndDate={setEndDate}
+                setStartDate={handleStartDateChange}
+                setEndDate={handleEndDateChange}
                 setAllTime={setAllTime}
                 setStartHour={setStartHour}
+                mode={mode}
+                setMode={setMode}
                 onCreate={createEvent}
+                summaryForEvent={summaryForEvent}
               />
             ) : (
               <EventDetail
@@ -185,6 +291,8 @@
                 setHoverInfo={setHoverInfo}
                 hoverAnchor={hoverAnchor}
                 onBack={()=>setSelectedId(null)}
+                fixedSlotId={fixedSlotId}
+                userName={userName}
               />
             )}
 
@@ -204,26 +312,48 @@
         );
       }
 
-      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,onCreate}){
+      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent}){
         return (
           <div className="space-y-8">
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Your events</h2>
               {events.length ? (
                 <ul className="divide-y">
-                  {events.map(ev => (
-                    <li key={ev.id} className="py-3 flex items-center justify-between">
-                      <div className="text-sm">
-                        <div className="font-medium">{ev.title}</div>
-                        <div className="text-gray-500">Hosted by: <b>{ev.organizer || '—'}</b></div>
-                        <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} {ev.allTime ? '· All time' : `· ${labelHour(ev.startHour ?? 8)}–midnight`}</div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button onClick={()=>onSelect(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
-                        <button onClick={()=>onDelete(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
-                      </div>
-                    </li>
-                  ))}
+                  {events.map(ev => {
+                    const summary = summaryForEvent(ev);
+                    return (
+                      <li key={ev.id} className="py-3 flex items-center justify-between">
+                        <div className="text-sm">
+                          <div className="font-medium flex items-center gap-2">
+                            {ev.title}
+                            <span className={"text-[10px] px-1.5 py-0.5 rounded border " + (ev.mode==='poll'?'bg-blue-50 border-blue-300 text-blue-700':'bg-purple-50 border-purple-300 text-purple-700')}>
+                              {ev.mode==='poll'?'Find a time':'Fixed'}
+                            </span>
+                          </div>
+                          <div className="text-gray-500">Hosted by: <b>{ev.organizer || '—'}</b></div>
+                          <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} {ev.allTime ? '· All time' : `· ${labelHour(ev.startHour ?? 8)}–midnight`}</div>
+
+                          {/* Summary line */}
+                          {summary?.type==='fixed' ? (
+                            <div className="text-[12px] mt-1">
+                              <b>Attending:</b> {summary.yes} {summary.yes===1?'person':'people'}
+                              {summary.names.yes.length ? ` — ${summary.names.yes.join(', ')}` : ''}
+                              {summary.maybe ? ` · Maybe: ${summary.maybe}` : ''}
+                            </div>
+                          ) : summary?.type==='poll' && summary.best ? (
+                            <div className="text-[12px] mt-1">
+                              <b>Top candidate:</b> {fmtDate(summary.best.start, tz)} · {fmtTime(summary.best.start, tz)} ·
+                              <span className="ml-1">Yes: {summary.best.yes} · Yes/Maybe: {summary.best.yesMaybe}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button onClick={()=>onSelect(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
+                          <button onClick={()=>onDelete(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               ) : (
                 <div className="text-sm text-gray-600">No events yet. Create one below.</div>
@@ -245,6 +375,13 @@
                   <span className="text-sm text-gray-700">End date</span>
                   <input type="date" className="border rounded-md px-2 py-1 text-sm" value={endDate} onChange={e=>setEndDate(e.target.value)} required/>
                 </label>
+                <label className="flex items-center gap-2 col-span-2 sm:col-span-2">
+                  <span className="text-sm text-gray-700">Event type</span>
+                  <select className="border rounded-md px-2 py-1 text-sm" value={mode} onChange={e=>setMode(e.target.value)}>
+                    <option value="poll">Find a time (confirm when people are free)</option>
+                    <option value="fixed">Fixed date (no confirmations needed)</option>
+                  </select>
+                </label>
                 <label className="flex items-center gap-2 col-span-2 sm:col-span-1">
                   <input type="checkbox" checked={allTime} onChange={e=>setAllTime(e.target.checked)}/>
                   <span className="text-sm text-gray-700">All time (24h)</span>
@@ -259,84 +396,132 @@
                   <button type="submit" className="text-sm px-3 py-2 rounded-lg border bg-emerald-50 hover:bg-emerald-100">Create event</button>
                 </div>
               </form>
-              <div className="mt-2 text-xs text-gray-500">If "All time" is off, we use a sensible default window: <b>8am–midnight</b> each day.</div>
+              <div className="mt-2 text-xs text-gray-500">If "All time" is off, we use a sensible default window: <b>8am–midnight</b> each day. End date auto-follows start date until you edit end date manually.</div>
             </section>
           </div>
         );
       }
 
-      function EventDetail({ tz, event, dayGroups, yourVotes, setVote, availsBySlot, best, hoverInfo, setHoverInfo, hoverAnchor, onBack }){
+      function EventDetail({ tz, event, dayGroups, yourVotes, setVote, availsBySlot, best, hoverInfo, setHoverInfo, hoverAnchor, onBack, fixedSlotId, userName }){
+        const isFixed = event.mode === 'fixed';
+        const hoverAnchorLocal = useRef(null);
+        const anchor = hoverAnchor || hoverAnchorLocal;
+
+        // Build hover name lists for the fixed RSVP slot
+        let fixedYes=[], fixedMaybe=[], fixedNo=[];
+        if(isFixed){
+          const fid = fixedSlotId(event.id);
+          const v = yourVotes.get(fid);
+          if(v==='yes') fixedYes = [userName || 'You'];
+          else if(v==='maybe') fixedMaybe = [userName || 'You'];
+          else if(v==='no') fixedNo = [userName || 'You'];
+        }
+
         return (
           <div className="space-y-6">
             <section className="bg-white rounded-2xl shadow p-4 flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-semibold">{event.title}</h2>
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  {event.title}
+                  <span className={"text-[10px] px-1.5 py-0.5 rounded border " + (isFixed?'bg-purple-50 border-purple-300 text-purple-700':'bg-blue-50 border-blue-300 text-blue-700')}>
+                    {isFixed?'Fixed':'Find a time'}
+                  </span>
+                </h2>
                 <div className="text-xs text-gray-500">Hosted by: <b>{event.organizer || '—'}</b></div>
                 <div className="text-xs text-gray-500">Dates: <b>{fmtDate(event.startDate, tz)}</b> → <b>{fmtDate(event.endDate, tz)}</b> · {event.allTime ? 'All time' : `${labelHour(event.startHour ?? 8)}–midnight`}</div>
               </div>
               <button onClick={onBack} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">← Back</button>
             </section>
 
-            <section className="bg-white rounded-2xl shadow p-4">
-              {dayGroups.length === 0 ? (
-                <div className="text-sm text-gray-600">No dates in this event.</div>
-              ) : (
-                <div className="space-y-6">
-                  {dayGroups.map(g => (
-                    <div key={g.dayKey}>
-                      <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
-                      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
-                        {g.slots.map(s => {
-                          const yours = yourVotes.get(s.id); // no default
-                          const list = availsBySlot.get(s.id) || [];
-                          const yesNames = list.filter(a => a.value === 'yes').map(a => a.participantName);
-                          const maybeNames = list.filter(a => a.value === 'maybe').map(a => a.participantName);
-                          const noNames = list.filter(a => a.value === 'no').map(a => a.participantName);
-                          const onEnter = (e)=>{ (hoverAnchor||{}).current = e.currentTarget; setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } }); };
-                          const onLeave = ()=> setHoverInfo({ visible: false, names: { yes: [], maybe: [], no: [] } });
-                          return (
-                            <div key={s.id} className="border rounded-lg p-2" onMouseEnter={onEnter} onMouseLeave={onLeave}>
-                              <div className="text-[11px] text-gray-600 mb-1">{fmtTime(s.start, tz)}</div>
-                              <SegmentedVote value={yours} onChange={(v)=>setVote(s.id, v)} onHoverNames={()=>setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } })} />
-                              {/* No inline 'No: names' display */}
-                            </div>
-                          );
-                        })}
+            {isFixed ? (
+              <section className="bg-white rounded-2xl shadow p-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm">Will you attend?</div>
+                  <div
+                    ref={anchor}
+                    onMouseEnter={()=>setHoverInfo({visible:true, names:{yes:fixedYes, maybe:fixedMaybe, no:fixedNo}})}
+                    onMouseLeave={()=>setHoverInfo({visible:false, names:{yes:[], maybe:[], no:[]}})}
+                  >
+                    <SegmentedVote
+                      value={yourVotes.get(fixedSlotId(event.id))}
+                      onChange={(v)=>setVote(fixedSlotId(event.id), v)}
+                    />
+                  </div>
+                </div>
+                <HoverCard visible={hoverInfo.visible} anchorRef={anchor}>
+                  <div className="space-y-1">
+                    <div><b>Yes</b> {fixedYes.length ? `(${fixedYes.length})` : ''}</div>
+                    <div className="text-gray-600">{fixedYes.join(', ') || '—'}</div>
+                    <div className="mt-2"><b>Maybe</b> {fixedMaybe.length ? `(${fixedMaybe.length})` : ''}</div>
+                    <div className="text-gray-600">{fixedMaybe.join(', ') || '—'}</div>
+                    <div className="mt-2"><b>No</b> {fixedNo.length ? `(${fixedNo.length})` : ''}</div>
+                    <div className="text-gray-600">{fixedNo.join(', ') || '—'}</div>
+                  </div>
+                </HoverCard>
+              </section>
+            ) : (
+              <section className="bg-white rounded-2xl shadow p-4">
+                {dayGroups.length === 0 ? (
+                  <div className="text-sm text-gray-600">No dates in this event.</div>
+                ) : (
+                  <div className="space-y-6">
+                    {dayGroups.map(g => (
+                      <div key={g.dayKey}>
+                        <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
+                          {g.slots.map(s => {
+                            const yours = yourVotes.get(s.id); // no default
+                            const list = availsBySlot.get(s.id) || [];
+                            const yesNames = list.filter(a => a.value === 'yes').map(a => a.participantName);
+                            const maybeNames = list.filter(a => a.value === 'maybe').map(a => a.participantName);
+                            const noNames = list.filter(a => a.value === 'no').map(a => a.participantName);
+                            const onEnter = (e)=>{ (anchor||{}).current = e.currentTarget; setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } }); };
+                            const onLeave = ()=> setHoverInfo({ visible: false, names: { yes: [], maybe: [], no: [] } });
+                            return (
+                              <div key={s.id} className="border rounded-lg p-2" onMouseEnter={onEnter} onMouseLeave={onLeave}>
+                                <div className="text-[11px] text-gray-600 mb-1">{fmtTime(s.start, tz)}</div>
+                                <SegmentedVote value={yours} onChange={(v)=>setVote(s.id, v)} onHoverNames={()=>setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } })} />
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <HoverCard visible={hoverInfo.visible} anchorRef={hoverAnchor}>
-                <div className="space-y-1">
-                  <div><b>Yes</b> {hoverInfo.names.yes.length ? `(${hoverInfo.names.yes.length})` : ''}</div>
-                  <div className="text-gray-600">{hoverInfo.names.yes.join(', ') || '—'}</div>
-                  <div className="mt-2"><b>Maybe</b> {hoverInfo.names.maybe.length ? `(${hoverInfo.names.maybe.length})` : ''}</div>
-                  <div className="text-gray-600">{hoverInfo.names.maybe.join(', ') || '—'}</div>
-                  <div className="mt-2"><b>No</b> {hoverInfo.names.no.length ? `(${hoverInfo.names.no.length})` : ''}</div>
-                  <div className="text-gray-600">{hoverInfo.names.no.join(', ') || '—'}</div>
-                </div>
-              </HoverCard>
-            </section>
+                    ))}
+                  </div>
+                )}
+                <HoverCard visible={hoverInfo.visible} anchorRef={anchor}>
+                  <div className="space-y-1">
+                    <div><b>Yes</b> {hoverInfo.names.yes.length ? `(${hoverInfo.names.yes.length})` : ''}</div>
+                    <div className="text-gray-600">{hoverInfo.names.yes.join(', ') || '—'}</div>
+                    <div className="mt-2"><b>Maybe</b> {hoverInfo.names.maybe.length ? `(${hoverInfo.names.maybe.length})` : ''}</div>
+                    <div className="text-gray-600">{hoverInfo.names.maybe.join(', ') || '—'}</div>
+                    <div className="mt-2"><b>No</b> {hoverInfo.names.no.length ? `(${hoverInfo.names.no.length})` : ''}</div>
+                    <div className="text-gray-600">{hoverInfo.names.no.join(', ') || '—'}</div>
+                  </div>
+                </HoverCard>
+              </section>
+            )}
 
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h3 className="text-lg font-semibold mb-2">Top candidate</h3>
-              {best ? (
-                <div className="flex flex-wrap items-center gap-3 text-sm">
-                  <span>Time:</span>
-                  <Pill>{fmtDate(best.start, tz)} · {fmtTime(best.start, tz)}</Pill>
-                  <span>Score:</span>
-                  <Pill>{best.score}</Pill>
-                  <span>Yes:</span>
-                  <Pill>{best.yes}</Pill>
-                  <span>Yes/Maybe:</span>
-                  <Pill>{best.yesMaybe}</Pill>
-                </div>
-              ) : (
-                <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>
-              )}
-              <div className="mt-3 text-xs text-gray-500">Tie‑breakers: highest score → most Yes → earliest.</div>
-            </section>
+            {!isFixed && (
+              <section className="bg-white rounded-2xl shadow p-4">
+                <h3 className="text-lg font-semibold mb-2">Top candidate</h3>
+                {best ? (
+                  <div className="flex flex-wrap items-center gap-3 text-sm">
+                    <span>Time:</span>
+                    <Pill>{fmtDate(best.start, tz)} · {fmtTime(best.start, tz)}</Pill>
+                    <span>Score:</span>
+                    <Pill>{best.score}</Pill>
+                    <span>Yes:</span>
+                    <Pill>{best.yes}</Pill>
+                    <span>Yes/Maybe:</span>
+                    <Pill>{best.yesMaybe}</Pill>
+                  </div>
+                ) : (
+                  <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>
+                )}
+                <div className="mt-3 text-xs text-gray-500">Tie‑breakers: highest score → most Yes → earliest.</div>
+              </section>
+            )}
           </div>
         );
       }
