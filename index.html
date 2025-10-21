@@ -1,27 +1,23 @@
-
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Live Sync)</title>
+    <title>Team — Plan Picker (Realtime + Modular SDK)</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- React -->
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <!-- Firebase SDKs (compat) -->
-    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
     <style>html,body,#root{height:100%;background:#fff}</style>
   </head>
   <body>
     <div id="root"></div>
 
-    <script type="text/babel" data-presets="env,react">
-      const { useMemo, useState, useRef, useEffect, useCallback } = React;
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
+      import { getFirestore, collection, addDoc, doc, setDoc, onSnapshot, query, orderBy, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+      import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
 
-      // -------- Firebase config (your real keys) --------
       const firebaseConfig = {
         apiKey: "AIzaSyCrgMr4JyvEunCIdVTmIBpkRan8tkhGefI",
         authDomain: "teamtectle.firebaseapp.com",
@@ -31,22 +27,24 @@
         appId: "1:1047184210223:web:567b12981e12b9893d49da"
       };
 
-      let db = null;
+      let db = null, auth = null;
       try {
-        if (firebaseConfig && firebaseConfig.projectId && !firebase.apps.length) {
-          firebase.initializeApp(firebaseConfig);
-          db = firebase.firestore();
-        }
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
       } catch (e) {
-        console.warn("Firebase init failed, falling back to localStorage", e);
+        console.warn("Firebase init failed; app will run in local-only mode.", e);
       }
+      window.__fb = { db, auth, collection, addDoc, doc, setDoc, onSnapshot, query, orderBy, getDocs, deleteDoc, signInAnonymously, onAuthStateChanged };
+    </script>
 
-      // -------- localStorage fallback --------
-      const LS_KEY = "teamPlanner:remoteFallback:v1";
+    <script type="text/babel" data-presets="env,react">
+      const { useMemo, useState, useEffect } = React;
+
+      const LS_KEY = "teamPlanner:fallback:v3";
       const saveToLS = (obj)=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }catch(e){} };
       const loadFromLS = ()=>{ try{ const raw=localStorage.getItem(LS_KEY); return raw? JSON.parse(raw): null; }catch(e){return null;} };
 
-      // -------- utils --------
       const MS = 60 * 1000;
       const fmtDate = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,weekday:"short",month:"short",day:"numeric"}).format(new Date(d));
       const fmtTime = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,hour:"numeric",minute:"2-digit"}).format(new Date(d));
@@ -66,15 +64,12 @@
         return days;
       }
 
-      // Scoring: yes = 1, maybe = 1
-      const votePts=(v)=> (v==='yes'||v==='maybe') ? 1 : 0;
       function pickBestSlot(allSlots,availsBySlot){
         if(!allSlots.length) return null;
         const scored = allSlots.map(s=>{
           const list = availsBySlot.get(s.id)||[];
           const supporters = list.filter(a=> a.value==='yes' || a.value==='maybe').length;
-          const score = supporters; // simple
-          return {...s, supporters, score};
+          return {...s, supporters, score: supporters};
         });
         const allZero = scored.every(x=>x.supporters===0);
         if(allZero) return null;
@@ -82,48 +77,35 @@
         return scored[0];
       }
 
-      // Vote keys (per event)
-      const makePollVoteKey = (eventId, slotId) => `${eventId}::${slotId}`;
-      const fixedVoteKey = (eventId, user) => `fixed::${eventId}::${user}`; // per user RSVP for fixed
+      const pollVoteDocId = (uid, slotId) => `${uid}::${slotId}`;
+      const fixedVoteDocId = (uid) => `fixed::${uid}`;
 
-      // Firestore collections
-      const evCol = ()=> db.collection("team_events");
-      const votesCol = (eventId)=> db.collection("team_events").doc(eventId).collection("votes");
-
-      // ----- UI bits -----
       function Pill({children}){ return <span className="px-2 py-0.5 rounded-full text-xs border">{children}</span>; }
-      function SegmentedVote({value, onChange, onHoverNames}){
+      function SegmentedVote({value, onChange}){
         const base="text-[11px] px-1.5 py-0.5 rounded-md border hover:bg-gray-50";
-        return (<div className="inline-flex gap-1" onMouseEnter={onHoverNames}>
+        return (<div className="inline-flex gap-1">
           <button type="button" className={base + (value==='yes'?' bg-green-100 border-green-300':'')} onClick={()=>onChange('yes')}>Yes</button>
           <button type="button" className={base + (value==='maybe'?' bg-yellow-100 border-yellow-300':'')} onClick={()=>onChange('maybe')}>Maybe</button>
           <button type="button" className={base + (value==='no'?' bg-red-100 border-red-300':'')} onClick={()=>onChange('no')}>No</button>
         </div>);
       }
-      function HoverCard({visible, anchorRef, children}){
-        const [style,setStyle]=useState({});
-        useEffect(()=>{
-          if(!anchorRef?.current||!visible) return;
-          const rect = anchorRef.current.getBoundingClientRect();
-          setStyle({position:'fixed', top:rect.bottom+6, left:Math.min(rect.left, window.innerWidth-260), width:260, zIndex:50});
-        },[anchorRef,visible]);
-        if(!visible) return null;
-        return <div style={style} className="bg-white border shadow-lg rounded-xl p-3 text-xs">{children}</div>;
-      }
 
-      // ----- App -----
       function App(){
+        const FB = window.__fb || {};
+        const db = FB.db || null;
+        const auth = FB.auth || null;
+        const { collection, addDoc, doc, setDoc, onSnapshot, query, orderBy, getDocs, deleteDoc, signInAnonymously, onAuthStateChanged } = FB;
+
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
         const now = new Date();
         const nextSat = useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
         const nextSun = useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
         const toYMD = (d)=> `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
-        // identity
         const [userName,setUserName]=useState('');
         const [isEditingUser,setIsEditingUser]=useState(true);
+        const [uid,setUid]=useState(null);
 
-        // event form state
         const [title,setTitle]=useState('');
         const [startDate,setStartDate]=useState(toYMD(nextSat));
         const [endDate,setEndDate]=useState(toYMD(nextSun));
@@ -132,67 +114,64 @@
         const [mode,setMode]=useState('poll');
         const [endTouched,setEndTouched]=useState(false);
 
-        // events + selection
         const [events,setEvents]=useState([]);
         const [selectedId,setSelectedId]=useState(null);
-
-        // votes (local shadow for UI state; source of truth is Firestore if enabled)
         const [yourVotes,setYourVotes]=useState(new Map());
 
-        // hover
-        const [hoverInfo,setHoverInfo]=useState({visible:false, names:{yes:[], maybe:[], no:[]}});
-        const hoverAnchor = useRef(null);
-
-        // Load from localStorage if no Firestore
         useEffect(()=>{
-          if(db) return; // using cloud
-          const saved = loadFromLS();
-          if(saved){
-            setUserName(saved.userName || '');
-            setIsEditingUser(!saved.userName);
-            setEvents(saved.events || []);
-            setSelectedId(saved.selectedId || null);
-            setYourVotes(new Map(saved.votes || []));
+          if (auth) {
+            const unsub = onAuthStateChanged(auth, async (u) => {
+              if (u) setUid(u.uid);
+              else {
+                try { const cred = await signInAnonymously(auth); setUid(cred.user?.uid || null); }
+                catch { setUid(null); }
+              }
+            });
+            return () => unsub && unsub();
+          } else {
+            const saved = loadFromLS();
+            if(saved){
+              setUserName(saved.userName || '');
+              setIsEditingUser(!saved.userName);
+              setEvents(saved.events || []);
+              setSelectedId(saved.selectedId || null);
+              setYourVotes(new Map(saved.votes || []));
+            }
           }
         },[]);
 
-        // Persist to localStorage if no Firestore
         useEffect(()=>{
-          if(db) return;
-          const toStore = {
-            userName, selectedId,
-            events, votes: Array.from(yourVotes.entries())
-          };
+          if(auth) return;
+          const toStore = { userName, selectedId, events, votes: Array.from(yourVotes.entries()) };
           saveToLS(toStore);
-        },[userName, selectedId, events, yourVotes]);
+        },[userName, selectedId, events, yourVotes, auth]);
 
-        // Firestore listeners
         useEffect(()=>{
           if(!db) return;
-          const unsub = evCol().orderBy("createdAt","asc").onSnapshot(snap=>{
-            const list = snap.docs.map(d=>( { id:d.id, ...d.data() } ));
+          const q = query(collection(db, "team_events"), orderBy("createdAt","asc"));
+          const unsub = onSnapshot(q, (snap)=>{
+            const list = snap.docs.map(d=>({ id:d.id, ...d.data() }));
             setEvents(list);
           });
           return unsub;
-        },[]);
+        },[db]);
 
-        // votes listener for selected event
         useEffect(()=>{
           if(!db || !selectedId) return;
-          const unsub = votesCol(selectedId).onSnapshot(snap=>{
+          const votesRef = collection(doc(db, "team_events", selectedId), "votes");
+          const unsub = onSnapshot(votesRef, (snap)=>{
             const map = new Map();
-            snap.forEach(doc=>{
-              const v = doc.data();
-              map.set(doc.id, v.value);
+            snap.forEach(docSnap => {
+              const v = docSnap.data();
+              map.set(docSnap.id, v.value);
             });
             setYourVotes(map);
           });
           return ()=>unsub && unsub();
-        },[selectedId]);
+        },[db, selectedId]);
 
         const selected = events.find(e=>e.id===selectedId)||null;
 
-        // helpers
         function handleStartDateChange(val){ setStartDate(val); if(!endTouched) setEndDate(val); }
         function handleEndDateChange(val){ setEndDate(val); setEndTouched(true); }
 
@@ -204,29 +183,30 @@
           const ev={ title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You', mode, createdAt: new Date().toISOString() };
 
           if(db){
-            const docRef = await evCol().add(ev);
-            // host auto-RSVP yes for fixed
-            if(mode==='fixed'){
-              await votesCol(docRef.id).doc(`fixed::${docRef.id}::${userName||'You'}`).set({ value:'yes', userName: userName||'You', createdAt: new Date().toISOString() });
+            const docRef = await addDoc(collection(db, "team_events"), ev);
+            if(mode==='fixed' && uid){
+              const votesRef = collection(doc(db, "team_events", docRef.id), "votes");
+              await setDoc(doc(votesRef, `fixed::${uid}`), { value:'yes', uid, userName: userName || 'You', createdAt: new Date().toISOString() });
             }
           }else{
             const id = Math.random().toString(36).slice(2);
             const newEv = { id, ...ev };
             setEvents(p=>[...p, newEv]);
             if(mode==='fixed'){
-              const k = `fixed::${id}::${userName||'You'}`;
-              setYourVotes(p=> new Map(p).set(k, 'yes'));
+              setYourVotes(p=> new Map(p).set(`fixed::local`, 'yes'));
             }
           }
 
           setTitle(''); setAllTime(false); setStartHour(8); setMode('poll'); setEndTouched(false);
         }
 
-        async function setVoteForEvent(evId, key, value, meta){
-          if(db){
-            const docId = (meta.type==='fixed') ? `fixed::${evId}::${meta.userName}` : `${meta.userName}::${meta.slotId}`;
-            await votesCol(evId).doc(docId).set({ value, userName: meta.userName, slotId: meta.slotId||null, createdAt: new Date().toISOString() });
+        async function setVoteForEvent(evId, value, meta){
+          if(db && uid){
+            const votesRef = collection(doc(db, "team_events", evId), "votes");
+            const docId = (meta.type==='fixed') ? `fixed::${uid}` : `${uid}::${meta.slotId}`;
+            await setDoc(doc(votesRef, docId), { value, uid, userName: userName || 'You', slotId: meta.slotId || null, updatedAt: new Date().toISOString() });
           }else{
+            const key = (meta.type==='fixed') ? `fixed::local` : `local::${meta.slotId}`;
             setYourVotes(p=> new Map(p).set(key, value));
           }
         }
@@ -234,27 +214,19 @@
         async function requestDelete(evId){
           if(!confirm("Delete this event?")) return;
           if(db){
-            const snap = await votesCol(evId).get();
-            const batch = db.batch();
-            snap.forEach(doc => batch.delete(doc.ref));
-            await batch.commit();
-            await evCol().doc(evId).delete();
+            const votesRef = collection(doc(db, "team_events", evId), "votes");
+            const snap = await getDocs(votesRef);
+            const ops = [];
+            snap.forEach(d => ops.push(deleteDoc(d.ref)));
+            await Promise.all(ops);
+            await deleteDoc(doc(db, "team_events", evId));
           }else{
             setEvents(p=>p.filter(e=>e.id!==evId));
-            setYourVotes(p=>{
-              const next = new Map();
-              p.forEach((val, key)=>{
-                if(key.startsWith(`fixed::${evId}::`)) return;
-                if(key.startsWith(`${evId}::`)) return;
-                next.set(key, val);
-              });
-              return next;
-            });
+            setYourVotes(new Map());
             if(selectedId===evId) setSelectedId(null);
           }
         }
 
-        // Build grids & summaries (for selected event)
         const dayGroups = useMemo(()=>{
           if(!selected || selected.mode==='fixed') return [];
           const sHour = selected.allTime?0:(selected.startHour ?? 8);
@@ -266,14 +238,12 @@
           const map = new Map();
           allSlots.forEach(s=>map.set(s.id, []));
           if(selected){
-            const prefix = `${selected.id}::`;
-            yourVotes.forEach((v, voteKey)=>{
-              if(voteKey.startsWith(prefix)){
-                const slotId = voteKey.slice(prefix.length);
+            yourVotes.forEach((v, docId)=>{
+              const parts = docId.split("::");
+              if(parts.length===2){
+                const slotId = parts[1];
                 if(map.has(slotId)){
-                  const arr = map.get(slotId);
-                  arr.push({slotId, participantName: 'You', value: v});
-                  map.set(slotId, arr);
+                  const arr = map.get(slotId); arr.push({slotId, participantName:'You', value:v}); map.set(slotId, arr);
                 }
               }
             });
@@ -283,40 +253,31 @@
 
         const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
 
+        function currentFixedValue(){ return yourVotes.get(`fixed::${uid || 'local'}`); }
+        function currentPollValue(slotId){ return yourVotes.get(`${uid || 'local'}::${slotId}`); }
+
         function summaryForEvent(ev){
           if(ev.mode==='fixed'){
-            if(!db){
-              let yes=0, names=[];
-              Array.from(yourVotes.entries()).forEach(([k,v])=>{
-                if(k.startsWith(`fixed::${ev.id}::`) && (v==='yes')){
-                  yes += 1;
-                  const nm = k.split('::')[2] || 'You';
-                  names.push(nm);
-                }
-              });
-              return { type:'fixed', yes, names };
-            } else {
-              return { type:'fixed', yes: '-', names: [] }; // simple on list view when using Firestore
-            }
+            if(db) return { type:'fixed', yes: '-', names: [] };
+            let yes=0;
+            Array.from(yourVotes.entries()).forEach(([k,v])=>{ if(k.startsWith("fixed::") && v==='yes') yes+=1; });
+            return { type:'fixed', yes, names: yes? ['You']:[] };
           } else {
             const sHour = ev.allTime?0:(ev.startHour ?? 8);
             const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
-            if(!slots.length) return { type:'poll', best:null };
             const map = new Map();
             slots.forEach(s=>map.set(s.id, []));
-            const prefix = `${ev.id}::`;
-            yourVotes.forEach((v, voteKey)=>{
-              if(voteKey.startsWith(prefix)){
-                const slotId = voteKey.slice(prefix.length);
+            yourVotes.forEach((v, docId)=>{
+              const parts = docId.split("::");
+              if(parts.length===2){
+                const slotId = parts[1];
                 if(map.has(slotId)){
-                  const arr = map.get(slotId);
-                  arr.push({slotId, participantName: 'You', value: v});
-                  map.set(slotId, arr);
+                  const arr = map.get(slotId); arr.push({slotId, participantName:'You', value:v}); map.set(slotId, arr);
                 }
               }
             });
-            const best = pickBestSlot(slots, map);
-            return { type:'poll', best };
+            const b = pickBestSlot(slots, map);
+            return { type:'poll', best: b };
           }
         }
 
@@ -339,6 +300,12 @@
               </div>
             </header>
 
+            {!db && (
+              <div className="p-3 rounded-xl border bg-yellow-50 text-sm mb-4">
+                Cloud sync is <b>off</b>. If this is unexpected, check your Firebase config and Firestore rules.
+              </div>
+            )}
+
             {!selected ? (
               <EventList
                 tz={tz}
@@ -351,8 +318,8 @@
                 allTime={allTime}
                 startHour={startHour}
                 setTitle={setTitle}
-                setStartDate={handleStartDateChange}
-                setEndDate={handleEndDateChange}
+                setStartDate={val=>{ setStartDate(val); if(!endTouched) setEndDate(val); }}
+                setEndDate={val=>{ setEndDate(val); setEndTouched(true); }}
                 setAllTime={setAllTime}
                 setStartHour={setStartHour}
                 mode={mode}
@@ -364,20 +331,14 @@
             ) : (
               <EventDetail
                 tz={tz}
-                event={events.find(e=>e.id===selectedId) || selected}
+                event={selected}
                 dayGroups={dayGroups}
                 yourVotes={yourVotes}
-                setVote={(key, val, meta)=>setVoteForEvent(selected.id, key, val, meta)}
-                availsBySlot={availsBySlot}
                 best={best}
-                hoverInfo={hoverInfo}
-                setHoverInfo={setHoverInfo}
-                hoverAnchor={hoverAnchor}
+                currentFixedValue={currentFixedValue}
+                currentPollValue={currentPollValue}
+                setVote={(val, meta)=>setVoteForEvent(selected.id, val, meta)}
                 onBack={()=>setSelectedId(null)}
-                fixedVoteKey={(user)=>fixedVoteKey(selected.id, user)}
-                makePollVoteKey={(slotId)=>makePollVoteKey(selected.id, slotId)}
-                userName={userName || 'You'}
-                dbEnabled={!!db}
               />
             )}
           </div>
@@ -387,11 +348,6 @@
       function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent, dbEnabled}){
         return (
           <div className="space-y-8">
-            {!dbEnabled && (
-              <div className="p-3 rounded-xl border bg-yellow-50 text-sm">
-                Cloud sync is <b>off</b>. Fill your Firebase config at the top of this file to enable multi-device sharing.
-              </div>
-            )}
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Your events</h2>
               {events.length ? (
@@ -413,10 +369,9 @@
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
                               <b>Attending:</b> {summary.yes}{summary.yes==='-'?'':' ' + (summary.yes===1?'person':'people')}
-                              {summary.names && summary.names.length ? ` — ${summary.names.join(', ')}` : ''}
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
-                            <div className="text-[12px] mt-1">
+                            <div className="text:[12px] mt-1">
                               <b>Top candidate:</b> {fmtDate(summary.best.start, tz)} · {fmtTime(summary.best.start, tz)} ·
                               <span className="ml-1">Supporters: {summary.best.supporters}</span>
                             </div>
@@ -477,11 +432,8 @@
         );
       }
 
-      function EventDetail({ tz, event, dayGroups, yourVotes, setVote, availsBySlot, best, hoverInfo, setHoverInfo, hoverAnchor, onBack, fixedVoteKey, makePollVoteKey, userName, dbEnabled }){
+      function EventDetail({ tz, event, dayGroups, yourVotes, best, currentFixedValue, currentPollValue, setVote, onBack }){
         const isFixed = event.mode === 'fixed';
-        const hoverAnchorLocal = useRef(null);
-        const anchor = hoverAnchor || hoverAnchorLocal;
-
         return (
           <div className="space-y-6">
             <section className="bg-white rounded-2xl shadow p-4 flex items-center justify-between">
@@ -502,12 +454,7 @@
               <section className="bg-white rounded-2xl shadow p-4">
                 <div className="flex items-center justify-between">
                   <div className="text-sm">Will you attend?</div>
-                  <div ref={anchor}>
-                    <SegmentedVote
-                      value={yourVotes.get(fixedVoteKey(userName))}
-                      onChange={(v)=>setVote(fixedVoteKey(userName), v, { type:'fixed', userName })}
-                    />
-                  </div>
+                  <SegmentedVote value={currentFixedValue()} onChange={(v)=>setVote(v, { type:'fixed' })} />
                 </div>
               </section>
             ) : (
@@ -521,17 +468,17 @@
                         <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
                         <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
                           {g.slots.map(s => {
-                            const key = makePollVoteKey(s.id);
-                            const yours = yourVotes.get(key);
-                            const list = availsBySlot.get(s.id) || [];
-                            const supporters = list.filter(a=> a.value==='yes' || a.value==='maybe').length;
+                            const supporters = (yourVotes && yourVotes.size) ? 0 + [...yourVotes.entries()].filter(([k,v]) => {
+                              const parts = k.split("::"); // uid::slotId
+                              return parts.length===2 && parts[1]===s.id && (v==='yes' || v==='maybe');
+                            }).length : 0;
                             return (
                               <div key={s.id} className="border rounded-lg p-2">
                                 <div className="text-[11px] text-gray-600 mb-1 flex justify-between">
                                   <span>{fmtTime(s.start, tz)}</span>
                                   <span className="text-gray-500">Supporters: {supporters}</span>
                                 </div>
-                                <SegmentedVote value={yours} onChange={(v)=>setVote(key, v, { type:'poll', userName, slotId: s.id })} />
+                                <SegmentedVote value={currentPollValue(s.id)} onChange={(v)=>setVote(v, { type:'poll', slotId: s.id })} />
                               </div>
                             );
                           })}
