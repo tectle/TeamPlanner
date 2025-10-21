@@ -4,53 +4,49 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Persistent, Fixed RSVP + Summaries)</title>
+    <title>Team — Plan Picker (Live Sync)</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React -->
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Firebase SDKs (compat) -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
     <style>html,body,#root{height:100%;background:#fff}</style>
   </head>
   <body>
     <div id="root"></div>
 
     <script type="text/babel" data-presets="env,react">
-      const { useMemo, useState, useRef, useEffect } = React;
+      const { useMemo, useState, useRef, useEffect, useCallback } = React;
 
-      // ----- persistence helpers -----
-      const LS_KEY = "teamPlanner:v3"; // bump version for new behavior
-      const nowISO = () => new Date().toISOString();
+      // -------- Firebase config (your real keys) --------
+      const firebaseConfig = {
+        apiKey: "AIzaSyCrgMr4JyvEunCIdVTmIBpkRan8tkhGefI",
+        authDomain: "teamtectle.firebaseapp.com",
+        projectId: "teamtectle",
+        storageBucket: "teamtectle.firebasestorage.app",
+        messagingSenderId: "1047184210223",
+        appId: "1:1047184210223:web:567b12981e12b9893d49da"
+      };
 
-      function saveToLS(state){
-        try {
-          const toStore = {
-            v: 3,
-            savedAt: nowISO(),
-            userName: state.userName,
-            events: state.events,
-            selectedId: state.selectedId,
-            votes: Array.from(state.yourVotes.entries()), // [slotId, vote]
-          };
-          localStorage.setItem(LS_KEY, JSON.stringify(toStore));
-        } catch (e) { console.warn("saveToLS failed", e); }
-      }
-      function loadFromLS(){
-        try {
-          const raw = localStorage.getItem(LS_KEY);
-          if(!raw) return null;
-          const data = JSON.parse(raw);
-          if(!data || typeof data !== "object") return null;
-          if((data.v !== 2 && data.v !== 3) || !Array.isArray(data.events) || !Array.isArray(data.votes)) return null;
-          return {
-            userName: data.userName || "",
-            events: data.events || [],
-            selectedId: data.selectedId || null,
-            yourVotes: new Map(data.votes),
-          };
-        } catch (e) { console.warn("loadFromLS failed", e); return null; }
+      let db = null;
+      try {
+        if (firebaseConfig && firebaseConfig.projectId && !firebase.apps.length) {
+          firebase.initializeApp(firebaseConfig);
+          db = firebase.firestore();
+        }
+      } catch (e) {
+        console.warn("Firebase init failed, falling back to localStorage", e);
       }
 
-      // ----- utils -----
+      // -------- localStorage fallback --------
+      const LS_KEY = "teamPlanner:remoteFallback:v1";
+      const saveToLS = (obj)=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }catch(e){} };
+      const loadFromLS = ()=>{ try{ const raw=localStorage.getItem(LS_KEY); return raw? JSON.parse(raw): null; }catch(e){return null;} };
+
+      // -------- utils --------
       const MS = 60 * 1000;
       const fmtDate = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,weekday:"short",month:"short",day:"numeric"}).format(new Date(d));
       const fmtTime = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,hour:"numeric",minute:"2-digit"}).format(new Date(d));
@@ -69,24 +65,30 @@
         }
         return days;
       }
-      const votePts=(v)=> v==='yes'?2: v==='maybe'?1: 0;
+
+      // Scoring: yes = 1, maybe = 1
+      const votePts=(v)=> (v==='yes'||v==='maybe') ? 1 : 0;
       function pickBestSlot(allSlots,availsBySlot){
         if(!allSlots.length) return null;
         const scored = allSlots.map(s=>{
           const list = availsBySlot.get(s.id)||[];
-          const yes = list.filter(a=>a.value==='yes').length;
-          const yesMaybe = list.filter(a=>a.value!=='no').length;
-          const score = list.reduce((acc,a)=>acc+votePts(a.value)*(a.weight??1),0);
-          return {...s, yes, yesMaybe, score};
+          const supporters = list.filter(a=> a.value==='yes' || a.value==='maybe').length;
+          const score = supporters; // simple
+          return {...s, supporters, score};
         });
-        const allZero = scored.every(x=>x.score===0 && x.yes===0 && x.yesMaybe===0);
+        const allZero = scored.every(x=>x.supporters===0);
         if(allZero) return null;
-        scored.sort((a,b)=> b.score-a.score || b.yes-a.yes || (new Date(a.start)-new Date(b.start)));
+        scored.sort((a,b)=> b.supporters-a.supporters || (new Date(a.start)-new Date(b.start)));
         return scored[0];
       }
 
-      // Special slot id for fixed events RSVP
-      const fixedSlotId = (eventId)=> `fixed::${eventId}`;
+      // Vote keys (per event)
+      const makePollVoteKey = (eventId, slotId) => `${eventId}::${slotId}`;
+      const fixedVoteKey = (eventId, user) => `fixed::${eventId}::${user}`; // per user RSVP for fixed
+
+      // Firestore collections
+      const evCol = ()=> db.collection("team_events");
+      const votesCol = (eventId)=> db.collection("team_events").doc(eventId).collection("votes");
 
       // ----- UI bits -----
       function Pill({children}){ return <span className="px-2 py-0.5 rounded-full text-xs border">{children}</span>; }
@@ -103,47 +105,156 @@
         useEffect(()=>{
           if(!anchorRef?.current||!visible) return;
           const rect = anchorRef.current.getBoundingClientRect();
-          setStyle({position:'fixed', top:rect.bottom+6, left:Math.min(rect.left, window.innerWidth-260), width:240, zIndex:50});
+          setStyle({position:'fixed', top:rect.bottom+6, left:Math.min(rect.left, window.innerWidth-260), width:260, zIndex:50});
         },[anchorRef,visible]);
         if(!visible) return null;
         return <div style={style} className="bg-white border shadow-lg rounded-xl p-3 text-xs">{children}</div>;
       }
 
-      // ----- Main App -----
+      // ----- App -----
       function App(){
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-        const loaded = loadFromLS();
-
         const now = new Date();
         const nextSat = useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
         const nextSun = useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
         const toYMD = (d)=> `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
-        const [userName,setUserName]=useState(loaded?.userName ?? '');
-        const [isEditingUser,setIsEditingUser]=useState(!loaded?.userName);
-        const [events,setEvents]=useState(loaded?.events ?? []);
-        const [selectedId,setSelectedId]=useState(loaded?.selectedId ?? null);
+        // identity
+        const [userName,setUserName]=useState('');
+        const [isEditingUser,setIsEditingUser]=useState(true);
 
+        // event form state
         const [title,setTitle]=useState('');
         const [startDate,setStartDate]=useState(toYMD(nextSat));
         const [endDate,setEndDate]=useState(toYMD(nextSun));
         const [allTime,setAllTime]=useState(false);
         const [startHour,setStartHour]=useState(8);
-        const [mode,setMode]=useState('poll'); // 'poll' | 'fixed'
+        const [mode,setMode]=useState('poll');
         const [endTouched,setEndTouched]=useState(false);
 
-        const [yourVotes,setYourVotes]=useState(()=> loaded?.yourVotes ?? new Map());
-        const [confirmDeleteId,setConfirmDeleteId]=useState(null);
-        const confirmEvent = events.find(e=>e.id===confirmDeleteId)||null;
-        const selected = events.find(e=>e.id===selectedId)||null;
+        // events + selection
+        const [events,setEvents]=useState([]);
+        const [selectedId,setSelectedId]=useState(null);
 
-        // Create slots for a given event (for summary/best)
-        const eventSlots = React.useCallback((ev)=>{
-          const sHour = ev.allTime?0:(ev.startHour ?? 8);
-          return generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
+        // votes (local shadow for UI state; source of truth is Firestore if enabled)
+        const [yourVotes,setYourVotes]=useState(new Map());
+
+        // hover
+        const [hoverInfo,setHoverInfo]=useState({visible:false, names:{yes:[], maybe:[], no:[]}});
+        const hoverAnchor = useRef(null);
+
+        // Load from localStorage if no Firestore
+        useEffect(()=>{
+          if(db) return; // using cloud
+          const saved = loadFromLS();
+          if(saved){
+            setUserName(saved.userName || '');
+            setIsEditingUser(!saved.userName);
+            setEvents(saved.events || []);
+            setSelectedId(saved.selectedId || null);
+            setYourVotes(new Map(saved.votes || []));
+          }
         },[]);
 
-        // derive day grid for selected
+        // Persist to localStorage if no Firestore
+        useEffect(()=>{
+          if(db) return;
+          const toStore = {
+            userName, selectedId,
+            events, votes: Array.from(yourVotes.entries())
+          };
+          saveToLS(toStore);
+        },[userName, selectedId, events, yourVotes]);
+
+        // Firestore listeners
+        useEffect(()=>{
+          if(!db) return;
+          const unsub = evCol().orderBy("createdAt","asc").onSnapshot(snap=>{
+            const list = snap.docs.map(d=>( { id:d.id, ...d.data() } ));
+            setEvents(list);
+          });
+          return unsub;
+        },[]);
+
+        // votes listener for selected event
+        useEffect(()=>{
+          if(!db || !selectedId) return;
+          const unsub = votesCol(selectedId).onSnapshot(snap=>{
+            const map = new Map();
+            snap.forEach(doc=>{
+              const v = doc.data();
+              map.set(doc.id, v.value);
+            });
+            setYourVotes(map);
+          });
+          return ()=>unsub && unsub();
+        },[selectedId]);
+
+        const selected = events.find(e=>e.id===selectedId)||null;
+
+        // helpers
+        function handleStartDateChange(val){ setStartDate(val); if(!endTouched) setEndDate(val); }
+        function handleEndDateChange(val){ setEndDate(val); setEndTouched(true); }
+
+        async function createEvent(e){
+          e.preventDefault();
+          if(!title.trim()) return;
+          const start=new Date(startDate), end=new Date(endDate);
+          if(start>end){ alert('Start date must be before end date.'); return; }
+          const ev={ title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You', mode, createdAt: new Date().toISOString() };
+
+          if(db){
+            const docRef = await evCol().add(ev);
+            // host auto-RSVP yes for fixed
+            if(mode==='fixed'){
+              await votesCol(docRef.id).doc(`fixed::${docRef.id}::${userName||'You'}`).set({ value:'yes', userName: userName||'You', createdAt: new Date().toISOString() });
+            }
+          }else{
+            const id = Math.random().toString(36).slice(2);
+            const newEv = { id, ...ev };
+            setEvents(p=>[...p, newEv]);
+            if(mode==='fixed'){
+              const k = `fixed::${id}::${userName||'You'}`;
+              setYourVotes(p=> new Map(p).set(k, 'yes'));
+            }
+          }
+
+          setTitle(''); setAllTime(false); setStartHour(8); setMode('poll'); setEndTouched(false);
+        }
+
+        async function setVoteForEvent(evId, key, value, meta){
+          if(db){
+            const docId = (meta.type==='fixed') ? `fixed::${evId}::${meta.userName}` : `${meta.userName}::${meta.slotId}`;
+            await votesCol(evId).doc(docId).set({ value, userName: meta.userName, slotId: meta.slotId||null, createdAt: new Date().toISOString() });
+          }else{
+            setYourVotes(p=> new Map(p).set(key, value));
+          }
+        }
+
+        async function requestDelete(evId){
+          if(!confirm("Delete this event?")) return;
+          if(db){
+            const snap = await votesCol(evId).get();
+            const batch = db.batch();
+            snap.forEach(doc => batch.delete(doc.ref));
+            await batch.commit();
+            await evCol().doc(evId).delete();
+          }else{
+            setEvents(p=>p.filter(e=>e.id!==evId));
+            setYourVotes(p=>{
+              const next = new Map();
+              p.forEach((val, key)=>{
+                if(key.startsWith(`fixed::${evId}::`)) return;
+                if(key.startsWith(`${evId}::`)) return;
+                next.set(key, val);
+              });
+              return next;
+            });
+            if(selectedId===evId) setSelectedId(null);
+          }
+        }
+
+        // Build grids & summaries (for selected event)
         const dayGroups = useMemo(()=>{
           if(!selected || selected.mode==='fixed') return [];
           const sHour = selected.allTime?0:(selected.startHour ?? 8);
@@ -151,86 +262,57 @@
         },[selected]);
         const allSlots = useMemo(()=> dayGroups.flatMap(g=>g.slots), [dayGroups]);
 
-        // availability map: user's votes + special fixed RSVP
         const availsBySlot = useMemo(()=>{
           const map = new Map();
-          // include poll slots if any
           allSlots.forEach(s=>map.set(s.id, []));
-          // include fixed special slot when selected is fixed
-          if(selected && selected.mode==='fixed'){
-            map.set(fixedSlotId(selected.id), []);
+          if(selected){
+            const prefix = `${selected.id}::`;
+            yourVotes.forEach((v, voteKey)=>{
+              if(voteKey.startsWith(prefix)){
+                const slotId = voteKey.slice(prefix.length);
+                if(map.has(slotId)){
+                  const arr = map.get(slotId);
+                  arr.push({slotId, participantName: 'You', value: v});
+                  map.set(slotId, arr);
+                }
+              }
+            });
           }
-          yourVotes.forEach((v,slotId)=>{
-            const arr = map.get(slotId) || [];
-            arr.push({slotId, participantName: userName || 'You', value: v, weight: 1});
-            map.set(slotId, arr);
-          });
           return map;
-        },[allSlots, yourVotes, userName, selected]);
+        },[allSlots, yourVotes, selected]);
 
-        const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots,availsBySlot]);
-        const [hoverInfo,setHoverInfo]=useState({visible:false, names:{yes:[], maybe:[], no:[]}});
-        const hoverAnchor = useRef(null);
+        const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
 
-        // Auto end date follows start date until end edited
-        function handleStartDateChange(val){
-          setStartDate(val);
-          if(!endTouched) setEndDate(val);
-        }
-        function handleEndDateChange(val){
-          setEndDate(val);
-          setEndTouched(true);
-        }
-
-        function createEvent(e){
-          e.preventDefault();
-          if(!title.trim()) return;
-          const start=new Date(startDate), end=new Date(endDate);
-          if(start>end){ alert('Start date must be before end date.'); return; }
-          const ev={ id: (crypto.randomUUID?.()||String(Math.random())), title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You', mode };
-          setEvents(p=>[...p, ev]);
-          setTitle(''); setAllTime(false); setStartHour(8); setMode('poll'); setEndTouched(false);
-        }
-        function setVote(slotId, v){ setYourVotes(p=> new Map(p).set(slotId, v)); }
-        function requestDelete(id){ setConfirmDeleteId(id); }
-        function performDelete(){ if(!confirmDeleteId) return; setEvents(p=>p.filter(e=>e.id!==confirmDeleteId)); if(selectedId===confirmDeleteId) setSelectedId(null); setConfirmDeleteId(null); }
-        function cancelDelete(){ setConfirmDeleteId(null); }
-
-        // ---- Persist whenever key state changes (debounced) ----
-        const saveDebounceRef = useRef(null);
-        function scheduleSave(){
-          if(saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-          saveDebounceRef.current = setTimeout(()=>{
-            saveToLS({ userName, events, selectedId, yourVotes });
-          }, 200);
-        }
-        useEffect(scheduleSave, [userName, events, selectedId, yourVotes]);
-
-        // ---- Main page summaries ----
         function summaryForEvent(ev){
           if(ev.mode==='fixed'){
-            const fid = fixedSlotId(ev.id);
-            const v = yourVotes.get(fid);
-            const yes = v==='yes' ? 1 : 0;
-            const maybe = v==='maybe' ? 1 : 0;
-            const no = v==='no' ? 1 : 0;
-            const names = {
-              yes: v==='yes' ? [userName || 'You'] : [],
-              maybe: v==='maybe' ? [userName || 'You'] : [],
-              no: v==='no' ? [userName || 'You'] : [],
-            };
-            return { type:'fixed', yes, maybe, no, names };
-          } else { // poll
-            const slots = eventSlots(ev);
+            if(!db){
+              let yes=0, names=[];
+              Array.from(yourVotes.entries()).forEach(([k,v])=>{
+                if(k.startsWith(`fixed::${ev.id}::`) && (v==='yes')){
+                  yes += 1;
+                  const nm = k.split('::')[2] || 'You';
+                  names.push(nm);
+                }
+              });
+              return { type:'fixed', yes, names };
+            } else {
+              return { type:'fixed', yes: '-', names: [] }; // simple on list view when using Firestore
+            }
+          } else {
+            const sHour = ev.allTime?0:(ev.startHour ?? 8);
+            const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
             if(!slots.length) return { type:'poll', best:null };
-            // Build per-event map from votes (one-user for now)
             const map = new Map();
             slots.forEach(s=>map.set(s.id, []));
-            yourVotes.forEach((v,slotId)=>{
-              if(map.has(slotId)){
-                const arr = map.get(slotId);
-                arr.push({slotId, participantName: userName || 'You', value: v});
-                map.set(slotId, arr);
+            const prefix = `${ev.id}::`;
+            yourVotes.forEach((v, voteKey)=>{
+              if(voteKey.startsWith(prefix)){
+                const slotId = voteKey.slice(prefix.length);
+                if(map.has(slotId)){
+                  const arr = map.get(slotId);
+                  arr.push({slotId, participantName: 'You', value: v});
+                  map.set(slotId, arr);
+                }
               }
             });
             const best = pickBestSlot(slots, map);
@@ -277,44 +359,39 @@
                 setMode={setMode}
                 onCreate={createEvent}
                 summaryForEvent={summaryForEvent}
+                dbEnabled={!!db}
               />
             ) : (
               <EventDetail
                 tz={tz}
-                event={selected}
+                event={events.find(e=>e.id===selectedId) || selected}
                 dayGroups={dayGroups}
                 yourVotes={yourVotes}
-                setVote={setVote}
+                setVote={(key, val, meta)=>setVoteForEvent(selected.id, key, val, meta)}
                 availsBySlot={availsBySlot}
                 best={best}
                 hoverInfo={hoverInfo}
                 setHoverInfo={setHoverInfo}
                 hoverAnchor={hoverAnchor}
                 onBack={()=>setSelectedId(null)}
-                fixedSlotId={fixedSlotId}
-                userName={userName}
+                fixedVoteKey={(user)=>fixedVoteKey(selected.id, user)}
+                makePollVoteKey={(slotId)=>makePollVoteKey(selected.id, slotId)}
+                userName={userName || 'You'}
+                dbEnabled={!!db}
               />
             )}
-
-            {confirmEvent ? (
-              <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
-                <div className="bg-white rounded-2xl shadow-xl p-5 w-[min(92vw,420px)]">
-                  <div className="text-base font-semibold mb-1">Delete event?</div>
-                  <div className="text-sm text-gray-600 mb-4">This will remove <b>{confirmEvent.title}</b> permanently.</div>
-                  <div className="flex justify-end gap-2">
-                    <button onClick={cancelDelete} className="px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100 text-sm">Cancel</button>
-                    <button onClick={performDelete} className="px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100 text-sm">Delete</button>
-                  </div>
-                </div>
-              </div>
-            ) : null}
           </div>
         );
       }
 
-      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent}){
+      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent, dbEnabled}){
         return (
           <div className="space-y-8">
+            {!dbEnabled && (
+              <div className="p-3 rounded-xl border bg-yellow-50 text-sm">
+                Cloud sync is <b>off</b>. Fill your Firebase config at the top of this file to enable multi-device sharing.
+              </div>
+            )}
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Your events</h2>
               {events.length ? (
@@ -333,17 +410,15 @@
                           <div className="text-gray-500">Hosted by: <b>{ev.organizer || '—'}</b></div>
                           <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} {ev.allTime ? '· All time' : `· ${labelHour(ev.startHour ?? 8)}–midnight`}</div>
 
-                          {/* Summary line */}
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
-                              <b>Attending:</b> {summary.yes} {summary.yes===1?'person':'people'}
-                              {summary.names.yes.length ? ` — ${summary.names.yes.join(', ')}` : ''}
-                              {summary.maybe ? ` · Maybe: ${summary.maybe}` : ''}
+                              <b>Attending:</b> {summary.yes}{summary.yes==='-'?'':' ' + (summary.yes===1?'person':'people')}
+                              {summary.names && summary.names.length ? ` — ${summary.names.join(', ')}` : ''}
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
                             <div className="text-[12px] mt-1">
                               <b>Top candidate:</b> {fmtDate(summary.best.start, tz)} · {fmtTime(summary.best.start, tz)} ·
-                              <span className="ml-1">Yes: {summary.best.yes} · Yes/Maybe: {summary.best.yesMaybe}</span>
+                              <span className="ml-1">Supporters: {summary.best.supporters}</span>
                             </div>
                           ) : null}
                         </div>
@@ -379,7 +454,7 @@
                   <span className="text-sm text-gray-700">Event type</span>
                   <select className="border rounded-md px-2 py-1 text-sm" value={mode} onChange={e=>setMode(e.target.value)}>
                     <option value="poll">Find a time (confirm when people are free)</option>
-                    <option value="fixed">Fixed date (no confirmations needed)</option>
+                    <option value="fixed">Fixed date (collect RSVPs)</option>
                   </select>
                 </label>
                 <label className="flex items-center gap-2 col-span-2 sm:col-span-1">
@@ -396,26 +471,16 @@
                   <button type="submit" className="text-sm px-3 py-2 rounded-lg border bg-emerald-50 hover:bg-emerald-100">Create event</button>
                 </div>
               </form>
-              <div className="mt-2 text-xs text-gray-500">If "All time" is off, we use a sensible default window: <b>8am–midnight</b> each day. End date auto-follows start date until you edit end date manually.</div>
+              <div className="mt-2 text-xs text-gray-500">For <b>Fixed</b> events, the host is auto‑RSVPed <b>Yes</b>. End date auto‑follows start date until you edit it.</div>
             </section>
           </div>
         );
       }
 
-      function EventDetail({ tz, event, dayGroups, yourVotes, setVote, availsBySlot, best, hoverInfo, setHoverInfo, hoverAnchor, onBack, fixedSlotId, userName }){
+      function EventDetail({ tz, event, dayGroups, yourVotes, setVote, availsBySlot, best, hoverInfo, setHoverInfo, hoverAnchor, onBack, fixedVoteKey, makePollVoteKey, userName, dbEnabled }){
         const isFixed = event.mode === 'fixed';
         const hoverAnchorLocal = useRef(null);
         const anchor = hoverAnchor || hoverAnchorLocal;
-
-        // Build hover name lists for the fixed RSVP slot
-        let fixedYes=[], fixedMaybe=[], fixedNo=[];
-        if(isFixed){
-          const fid = fixedSlotId(event.id);
-          const v = yourVotes.get(fid);
-          if(v==='yes') fixedYes = [userName || 'You'];
-          else if(v==='maybe') fixedMaybe = [userName || 'You'];
-          else if(v==='no') fixedNo = [userName || 'You'];
-        }
 
         return (
           <div className="space-y-6">
@@ -437,27 +502,13 @@
               <section className="bg-white rounded-2xl shadow p-4">
                 <div className="flex items-center justify-between">
                   <div className="text-sm">Will you attend?</div>
-                  <div
-                    ref={anchor}
-                    onMouseEnter={()=>setHoverInfo({visible:true, names:{yes:fixedYes, maybe:fixedMaybe, no:fixedNo}})}
-                    onMouseLeave={()=>setHoverInfo({visible:false, names:{yes:[], maybe:[], no:[]}})}
-                  >
+                  <div ref={anchor}>
                     <SegmentedVote
-                      value={yourVotes.get(fixedSlotId(event.id))}
-                      onChange={(v)=>setVote(fixedSlotId(event.id), v)}
+                      value={yourVotes.get(fixedVoteKey(userName))}
+                      onChange={(v)=>setVote(fixedVoteKey(userName), v, { type:'fixed', userName })}
                     />
                   </div>
                 </div>
-                <HoverCard visible={hoverInfo.visible} anchorRef={anchor}>
-                  <div className="space-y-1">
-                    <div><b>Yes</b> {fixedYes.length ? `(${fixedYes.length})` : ''}</div>
-                    <div className="text-gray-600">{fixedYes.join(', ') || '—'}</div>
-                    <div className="mt-2"><b>Maybe</b> {fixedMaybe.length ? `(${fixedMaybe.length})` : ''}</div>
-                    <div className="text-gray-600">{fixedMaybe.join(', ') || '—'}</div>
-                    <div className="mt-2"><b>No</b> {fixedNo.length ? `(${fixedNo.length})` : ''}</div>
-                    <div className="text-gray-600">{fixedNo.join(', ') || '—'}</div>
-                  </div>
-                </HoverCard>
               </section>
             ) : (
               <section className="bg-white rounded-2xl shadow p-4">
@@ -470,17 +521,17 @@
                         <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
                         <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
                           {g.slots.map(s => {
-                            const yours = yourVotes.get(s.id); // no default
+                            const key = makePollVoteKey(s.id);
+                            const yours = yourVotes.get(key);
                             const list = availsBySlot.get(s.id) || [];
-                            const yesNames = list.filter(a => a.value === 'yes').map(a => a.participantName);
-                            const maybeNames = list.filter(a => a.value === 'maybe').map(a => a.participantName);
-                            const noNames = list.filter(a => a.value === 'no').map(a => a.participantName);
-                            const onEnter = (e)=>{ (anchor||{}).current = e.currentTarget; setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } }); };
-                            const onLeave = ()=> setHoverInfo({ visible: false, names: { yes: [], maybe: [], no: [] } });
+                            const supporters = list.filter(a=> a.value==='yes' || a.value==='maybe').length;
                             return (
-                              <div key={s.id} className="border rounded-lg p-2" onMouseEnter={onEnter} onMouseLeave={onLeave}>
-                                <div className="text-[11px] text-gray-600 mb-1">{fmtTime(s.start, tz)}</div>
-                                <SegmentedVote value={yours} onChange={(v)=>setVote(s.id, v)} onHoverNames={()=>setHoverInfo({ visible: true, names: { yes: yesNames, maybe: maybeNames, no: noNames } })} />
+                              <div key={s.id} className="border rounded-lg p-2">
+                                <div className="text-[11px] text-gray-600 mb-1 flex justify-between">
+                                  <span>{fmtTime(s.start, tz)}</span>
+                                  <span className="text-gray-500">Supporters: {supporters}</span>
+                                </div>
+                                <SegmentedVote value={yours} onChange={(v)=>setVote(key, v, { type:'poll', userName, slotId: s.id })} />
                               </div>
                             );
                           })}
@@ -489,16 +540,6 @@
                     ))}
                   </div>
                 )}
-                <HoverCard visible={hoverInfo.visible} anchorRef={anchor}>
-                  <div className="space-y-1">
-                    <div><b>Yes</b> {hoverInfo.names.yes.length ? `(${hoverInfo.names.yes.length})` : ''}</div>
-                    <div className="text-gray-600">{hoverInfo.names.yes.join(', ') || '—'}</div>
-                    <div className="mt-2"><b>Maybe</b> {hoverInfo.names.maybe.length ? `(${hoverInfo.names.maybe.length})` : ''}</div>
-                    <div className="text-gray-600">{hoverInfo.names.maybe.join(', ') || '—'}</div>
-                    <div className="mt-2"><b>No</b> {hoverInfo.names.no.length ? `(${hoverInfo.names.no.length})` : ''}</div>
-                    <div className="text-gray-600">{hoverInfo.names.no.join(', ') || '—'}</div>
-                  </div>
-                </HoverCard>
               </section>
             )}
 
@@ -509,17 +550,13 @@
                   <div className="flex flex-wrap items-center gap-3 text-sm">
                     <span>Time:</span>
                     <Pill>{fmtDate(best.start, tz)} · {fmtTime(best.start, tz)}</Pill>
-                    <span>Score:</span>
-                    <Pill>{best.score}</Pill>
-                    <span>Yes:</span>
-                    <Pill>{best.yes}</Pill>
-                    <span>Yes/Maybe:</span>
-                    <Pill>{best.yesMaybe}</Pill>
+                    <span>Supporters:</span>
+                    <Pill>{best.supporters}</Pill>
                   </div>
                 ) : (
                   <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>
                 )}
-                <div className="mt-3 text-xs text-gray-500">Tie‑breakers: highest score → most Yes → earliest.</div>
+                <div className="mt-3 text-xs text-gray-500">Tie‑breaker: most supporters → earliest.</div>
               </section>
             )}
           </div>
