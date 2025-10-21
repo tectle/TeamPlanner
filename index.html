@@ -4,12 +4,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Name‑keyed votes)</title>
+    <title>Team — Plan Picker (Local-time date fix)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <style>html,body,#root{height:100%;background:#fff}</style>
+    <style>
+      html,body,#root{height:100%;background:#fff}
+      * { min-width: 0; }
+      .tap { padding: 10px 12px; font-size: 14px; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
@@ -20,7 +24,6 @@
       import { getFirestore, collection, addDoc, doc, setDoc, onSnapshot, query, orderBy, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
       import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
 
-      // Replace with your Firebase config (yours was already provided earlier)
       const firebaseConfig = {
         apiKey: "AIzaSyCrgMr4JyvEunCIdVTmIBpkRan8tkhGefI",
         authDomain: "teamtectle.firebaseapp.com",
@@ -44,27 +47,57 @@
     <script type="text/babel" data-presets="env,react">
       const { useMemo, useState, useEffect } = React;
 
-      const LS_KEY = "teamPlanner:nameKeyed:v1";
-      const saveToLS = (obj)=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }catch(e){} };
-      const loadFromLS = ()=>{ try{ const raw=localStorage.getItem(LS_KEY); return raw? JSON.parse(raw): null; }catch(e){return null;} };
-
-      // utils
+      // ---------- Utilities (LOCAL TIME, no UTC ISO) ----------
+      const LS_KEY = "teamPlanner:nameKeyed:v5";
       const normalizeName = (s)=> (s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
-      const MS = 60 * 1000;
-      const fmtDate = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,weekday:"short",month:"short",day:"numeric"}).format(new Date(d));
-      const fmtTime = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,hour:"numeric",minute:"2-digit"}).format(new Date(d));
-      const labelHour = (h)=>{ const ampm=h<12?'am':'pm'; const hour12=((h+11)%12)+1; return hour12+ampm; };
-      const atLocalStartOfDay = (dateStr)=>{ const [y,m,d]=dateStr.split('-').map(Number); return new Date(y,m-1,d,0,0,0,0).toISOString(); };
-      const addMinutes = (iso, mins)=> new Date(new Date(iso).getTime()+mins*MS).toISOString();
-      const addDays = (iso, days)=> new Date(new Date(iso).getTime()+days*24*60*MS).toISOString();
+      const setCookie = (name, value, days=365)=>{
+        const d = new Date(); d.setTime(d.getTime()+days*24*60*60*1000);
+        document.cookie = name+"="+encodeURIComponent(value)+";expires="+d.toUTCString()+";path=/;SameSite=Lax";
+      };
+      const getCookie = (name)=>{
+        const n = name+"="; const ca = document.cookie.split(';');
+        for(let c of ca){ while(c.charAt(0)==' ') c=c.substring(1); if(c.indexOf(n)==0) return decodeURIComponent(c.substring(n.length,c.length)); }
+        return "";
+      };
+      const saveProfile = (obj)=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); setCookie(LS_KEY, JSON.stringify(obj)); }catch(e){} };
+      const loadProfile = ()=>{
+        try{ const rawLS = localStorage.getItem(LS_KEY); if (rawLS) return JSON.parse(rawLS); }catch(e){}
+        try{ const rawC = getCookie(LS_KEY); if (rawC) return JSON.parse(rawC); }catch(e){}
+        return null;
+      };
+      const prefillFromQuery = ()=>{ const params = new URLSearchParams(window.location.search); const nm = params.get("name"); return nm ? nm.trim() : ""; };
 
+      // date helpers
+      const MS = 60 * 1000;
+      const fmtDate = (d, tz) => new Date(typeof d === 'number' ? d : d).toLocaleDateString(undefined, { timeZone: tz, weekday:'short', month:'short', day:'numeric' });
+      const fmtTime = (d, tz) => new Date(typeof d === 'number' ? d : d).toLocaleTimeString(undefined, { timeZone: tz, hour:'numeric', minute:'2-digit' });
+      const labelHour = (h)=>{ if(h===24) return 'midnight'; const ampm=h<12?'am':'pm'; const hour12=((h+11)%12)+1; return hour12+ampm; };
+
+      // Return local midnight (ms) for YYYY-MM-DD (no UTC conversion)
+      function localStartOfDayMs(ymd){
+        const [y,m,d] = ymd.split('-').map(Number);
+        return new Date(y, m-1, d, 0,0,0,0).getTime();
+      }
+      const addMinutesMs = (ms, mins)=> ms + mins*60*1000;
+      const addDaysMs = (ms, days)=> ms + days*24*60*60*1000;
+
+      // Slots use local ms and a stable local slotId (date|hour)
       function generateDailyHourRangeSlots(startDate,endDate,startHour,endHour){
-        const days=[]; const endISO=atLocalStartOfDay(endDate); let curISO=atLocalStartOfDay(startDate);
-        while(new Date(curISO)<=new Date(endISO)){
-          const dayStart=curISO; const slots=[];
-          for(let h=startHour;h<endHour;h++){ const start=addMinutes(dayStart,h*60); const end=addMinutes(start,60); slots.push({id:start+'_'+end,start,end}); }
-          days.push({dayKey:new Date(dayStart).toDateString(), dayISOStart:dayStart, slots});
-          curISO = addDays(dayStart,1);
+        const days=[];
+        const endStartMs = localStartOfDayMs(endDate);
+        let curMs = localStartOfDayMs(startDate);
+        while(curMs <= endStartMs){
+          const dayStartMs = curMs;
+          const slots=[];
+          for(let h=startHour; h<endHour; h++){
+            const startMs = addMinutesMs(dayStartMs, h*60);
+            const endMs = addMinutesMs(startMs, 60);
+            const dateIsoLocal = new Date(dayStartMs).toISOString().slice(0,10); // only for id's date part
+            const slotId = `${dateIsoLocal}|${h}`;
+            slots.push({ id: slotId, startMs, endMs });
+          }
+          days.push({ dayKey: new Date(dayStartMs).toDateString(), dayStartMs, slots });
+          curMs = addDaysMs(dayStartMs, 1);
         }
         return days;
       }
@@ -78,13 +111,13 @@
         });
         const allZero = scored.every(x=>x.supporters===0);
         if(allZero) return null;
-        scored.sort((a,b)=> b.supporters-a.supporters || (new Date(a.start)-new Date(b.start)));
+        scored.sort((a,b)=> b.supporters-a.supporters || (a.startMs - b.startMs));
         return scored[0];
       }
 
-      function Pill({children}){ return <span className="px-2 py-0.5 rounded-full text-xs border">{children}</span>; }
+      function Pill({children}){ return <span className="px-2 py-1 rounded-full text-xs border">{children}</span>; }
       function SegmentedVote({value, onChange, disabled}){
-        const base="text-[11px] px-1.5 py-0.5 rounded-md border " + (disabled ? "opacity-50 cursor-not-allowed" : "hover:bg-gray-50");
+        const base="tap text-[13px] px-2 py-1 rounded-md border " + (disabled ? "opacity-50 cursor-not-allowed" : "hover:bg-gray-50");
         return (<div className="inline-flex gap-1">
           <button type="button" className={base + (value==='yes'?' bg-green-100 border-green-300':'')} onClick={()=>!disabled && onChange('yes')}>Yes</button>
           <button type="button" className={base + (value==='maybe'?' bg-yellow-100 border-yellow-300':'')} onClick={()=>!disabled && onChange('maybe')}>Maybe</button>
@@ -94,7 +127,7 @@
 
       function HoverCard({ visible, anchorRect, names }){
         if (!visible || !anchorRect) return null;
-        const style = { position: 'fixed', top: anchorRect.bottom + 6, left: Math.min(anchorRect.left, window.innerWidth - 260), width: 240, zIndex: 50 };
+        const style = { position: 'fixed', top: anchorRect.bottom + 6, left: Math.min(anchorRect.left, window.innerWidth - 280), width: 260, zIndex: 50 };
         return (
           <div style={style} className="bg-white border shadow-lg rounded-xl p-3 text-xs">
             <div className="space-y-1">
@@ -117,62 +150,59 @@
 
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
         const now = new Date();
-        const nextSat = useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
-        const nextSun = useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
+        const nextSat = React.useMemo(()=>{ const d=new Date(now); const day=d.getDay(); const add=(6-day+7)%7||7; d.setDate(d.getDate()+add); return d; },[now]);
+        const nextSun = React.useMemo(()=>{ const d=new Date(nextSat); d.setDate(d.getDate()+1); return d; },[nextSat]);
         const toYMD = (d)=> `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 
-        const [userName,setUserName]=useState('');
-        const [isEditingUser,setIsEditingUser]=useState(true);
-        const [uid,setUid]=useState(null);
+        // Name profile
+        const [userName,setUserName]=React.useState('');
+        const [isEditingUser,setIsEditingUser]=React.useState(true);
+        const [uid,setUid]=React.useState(null);
 
-        const [title,setTitle]=useState('');
-        const [startDate,setStartDate]=useState(toYMD(nextSat));
-        const [endDate,setEndDate]=useState(toYMD(nextSun));
-        const [allTime,setAllTime]=useState(false);
-        const [startHour,setStartHour]=useState(8);
-        const [mode,setMode]=useState('poll');
-        const [endTouched,setEndTouched]=useState(false);
+        // Create form
+        const [title,setTitle]=React.useState('');
+        const [description,setDescription]=React.useState('');
+        const [startDate,setStartDate]=React.useState(toYMD(nextSat));
+        const [endDate,setEndDate]=React.useState(toYMD(nextSun));
+        const [startHour,setStartHour]=React.useState(8);
+        const [endHour,setEndHour]=React.useState(24);
+        const [mode,setMode]=React.useState('poll');
+        const [endTouched,setEndTouched]=React.useState(false);
 
-        const [events,setEvents]=useState([]);
-        const [selectedId,setSelectedId]=useState(null);
-        const [yourVotes,setYourVotes]=useState(new Map());
+        // Data
+        const [events,setEvents]=React.useState([]);
+        const [selectedId,setSelectedId]=React.useState(null);
+        const [yourVotes,setYourVotes]=React.useState(new Map());
 
-        const [namesBySlot,setNamesBySlot]=useState(new Map()); // slotId -> {yes:[], maybe:[], no:[]}
-        const [attendingMap,setAttendingMap]=useState({}); // eventId -> { yes, namesYes }
-        const [hoverState,setHoverState]=useState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} });
+        const [namesBySlot,setNamesBySlot]=React.useState(new Map());
+        const [attendingMap,setAttendingMap]=React.useState({});
+        const [hoverState,setHoverState]=React.useState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} });
 
-        // auth boot (still use anonymous to write; but vote identity is by nameKey)
-        useEffect(()=>{
-          if (auth) {
-            const unsub = onAuthStateChanged(auth, async (u) => {
-              if (u) setUid(u.uid);
-              else {
-                try { const cred = await signInAnonymously(auth); setUid(cred.user?.uid || null); }
-                catch { setUid(null); }
-              }
-            });
-            return () => unsub && unsub();
-          } else {
-            const saved = loadFromLS();
-            if(saved){
-              setUserName(saved.userName || '');
-              setIsEditingUser(!(saved.userName && saved.userName.trim()));
-              setEvents(saved.events || []);
-              setSelectedId(saved.selectedId || null);
-              setYourVotes(new Map(saved.votes || []));
-            }
-          }
+        // Prefill name
+        React.useEffect(()=>{
+          const prof = loadProfile();
+          const qName = prefillFromQuery();
+          const initialName = qName || (prof?.userName || '');
+          setUserName(initialName);
+          setIsEditingUser(!(initialName && initialName.trim()));
         },[]);
+        React.useEffect(()=>{ saveProfile({ userName }); },[userName]);
 
-        // local fallback persist
-        useEffect(()=>{
-          if(auth) return;
-          const toStore = { userName, selectedId, events, votes: Array.from(yourVotes.entries()) };
-          saveToLS(toStore);
-        },[userName, selectedId, events, yourVotes, auth]);
+        // Anonymous auth
+        React.useEffect(()=>{
+          if (!auth) return;
+          const unsub = onAuthStateChanged(auth, async (u) => {
+            if (u) setUid(u.uid);
+            else {
+              try { const cred = await signInAnonymously(auth); setUid(cred.user?.uid || null); }
+              catch { setUid(null); }
+            }
+          });
+          return () => unsub && unsub();
+        },[auth]);
 
-        // events
-        useEffect(()=>{
+        // Live events
+        React.useEffect(()=>{
           if(!db) return;
           const q = query(collection(db, "team_events"), orderBy("createdAt","asc"));
           const unsub = onSnapshot(q, (snap)=>{
@@ -182,8 +212,8 @@
           return unsub;
         },[db]);
 
-        // per-event votes for attending list
-        useEffect(()=>{
+        // Per-event fixed attending summaries
+        React.useEffect(()=>{
           if(!db) return;
           const unsubs = [];
           events.forEach(ev => {
@@ -204,15 +234,15 @@
           return ()=> unsubs.forEach(fn => fn && fn());
         },[db, events]);
 
-        // selected event votes (names-by-slot + current values)
-        useEffect(()=>{
+        // Selected event votes (for hover + current values)
+        React.useEffect(()=>{
           if(!db || !selectedId) return;
           const votesRef = collection(doc(db, "team_events", selectedId), "votes");
           const unsub = onSnapshot(votesRef, (snap)=>{
             const mapValues = new Map();
             const mapNames = new Map();
             snap.forEach(docSnap => {
-              const v = docSnap.data(); // { value, userName, slotId }
+              const v = docSnap.data();
               mapValues.set(docSnap.id, v.value);
               if (v.slotId) {
                 const bucket = mapNames.get(v.slotId) || { yes:[], maybe:[], no:[] };
@@ -235,7 +265,7 @@
         function handleEndDateChange(val){ setEndDate(val); setEndTouched(true); }
 
         const nameKey = normalizeName(userName);
-        const canAct = !!nameKey; // disable inputs until name saved
+        const canAct = !!nameKey;
 
         async function createEvent(e){
           e.preventDefault();
@@ -243,7 +273,18 @@
           if(!canAct){ alert("Please set your name first."); return; }
           const start=new Date(startDate), end=new Date(endDate);
           if(start>end){ alert('Start date must be before end date.'); return; }
-          const ev={ title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName.trim(), mode, createdAt: new Date().toISOString(), createdBy: (uid || null) };
+          if(endHour <= startHour){ alert("End time must be after start time."); return; }
+          const ev={
+            title: title.trim(),
+            description: description.trim(),
+            timezone: tz,
+            startDate, endDate,
+            startHour, endHour,
+            organizer: userName.trim(),
+            mode,
+            createdAt: new Date().toISOString(),
+            createdBy: (uid || null)
+          };
 
           if(db){
             const docRef = await addDoc(collection(db, "team_events"), ev);
@@ -260,7 +301,7 @@
             }
           }
 
-          setTitle(''); setAllTime(false); setStartHour(8); setMode('poll'); setEndTouched(false);
+          setTitle(''); setDescription(''); setStartHour(8); setEndHour(24); setMode('poll'); setEndTouched(false);
         }
 
         async function setVoteForEvent(evId, value, meta){
@@ -279,10 +320,6 @@
           if(!confirm("Delete this event?")) return;
           if(db){
             try {
-              if (ev.createdBy && uid !== ev.createdBy) {
-                alert("Only the event host can delete this event.");
-                return;
-              }
               const votesRef = collection(doc(db, "team_events", ev.id), "votes");
               const snap = await getDocs(votesRef);
               const ops = [];
@@ -291,20 +328,20 @@
               await deleteDoc(doc(db, "team_events", ev.id));
             } catch (e) {
               console.error(e);
-              alert("Delete failed. Check Firestore rules to allow hosts to delete their own events.");
+              alert("Delete failed. Check Firestore rules (they must allow delete for everyone).");
             }
           }
         }
 
-        // build grid
-        const dayGroups = useMemo(()=>{
+        const dayGroups = React.useMemo(()=>{
           if(!selected || selected.mode==='fixed') return [];
-          const sHour = selected.allTime?0:(selected.startHour ?? 8);
-          return generateDailyHourRangeSlots(selected.startDate, selected.endDate, sHour, 24);
+          const sHour = selected.startHour ?? 8;
+          const eHour = selected.endHour ?? 24;
+          return generateDailyHourRangeSlots(selected.startDate, selected.endDate, sHour, eHour);
         },[selected]);
-        const allSlots = useMemo(()=> dayGroups.flatMap(g=>g.slots), [dayGroups]);
+        const allSlots = React.useMemo(()=> dayGroups.flatMap(g=>g.slots), [dayGroups]);
 
-        const availsBySlot = useMemo(()=>{
+        const availsBySlot = React.useMemo(()=>{
           const map = new Map();
           allSlots.forEach(s=>map.set(s.id, []));
           if(selected){
@@ -319,10 +356,10 @@
           return map;
         },[allSlots, namesBySlot, selected]);
 
-        const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
+        const best = React.useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
 
-        function currentFixedValue(){ return yourVotes.get(`fixed::${nameKey}`); }
-        function currentPollValue(slotId){ return yourVotes.get(`${nameKey}::${slotId}`); }
+        function currentFixedValue(){ return yourVotes.get(`fixed::${normalizeName(userName)}`); }
+        function currentPollValue(slotId){ return yourVotes.get(`${normalizeName(userName)}::${slotId}`); }
 
         function openHover(e, slotId){
           const rect = e.currentTarget.getBoundingClientRect();
@@ -333,17 +370,19 @@
 
         function summaryForEvent(ev){
           const att = attendingMap[ev.id];
+          const sHour = ev.startHour ?? 8;
+          const eHour = ev.endHour ?? 24;
+          const timeLabel = `${labelHour(sHour)}–${labelHour(eHour)}`;
           if(ev.mode==='fixed'){
             if(att) {
               const names = att.namesYes || [];
               const first = names.slice(0,5).join(', ');
               const extra = Math.max(0, (names.length - 5));
-              return { type:'fixed', yes: att.yes, label: first + (extra? ` +${extra} more`: '') };
+              return { type:'fixed', yes: att.yes, label: first + (extra? ` +${extra} more`: ''), timeLabel };
             }
-            return { type:'fixed', yes: 0, label: '' };
+            return { type:'fixed', yes: 0, label: '', timeLabel };
           } else {
-            const sHour = ev.allTime?0:(ev.startHour ?? 8);
-            const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
+            const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, eHour).flatMap(g=>g.slots);
             const map = new Map();
             slots.forEach(s=>map.set(s.id, []));
             namesBySlot.forEach((bucket, slotId)=>{
@@ -354,24 +393,26 @@
               map.set(slotId, arr);
             });
             const b = pickBestSlot(slots, map);
-            return { type:'poll', best: b };
+            return { type:'poll', best: b, timeLabel };
           }
         }
 
         return (
-          <div className="bg-white min-h-screen p-6 max-w-7xl mx-auto font-sans">
-            <header className="flex items-center justify-between mb-4">
-              <h1 className="text-2xl font-semibold">🗓️ Team</h1>
+          <div className="bg-white min-h-screen p-4 sm:p-6 max-w-6xl mx-auto font-sans">
+            <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
+              <button onClick={()=>setSelectedId(null)} className="text-left">
+                <h1 className="text-2xl font-semibold hover:underline">🗓️ Team</h1>
+              </button>
               <div className="flex items-center gap-2">
                 {isEditingUser ? (
-                  <form onSubmit={(e)=>{e.preventDefault(); setIsEditingUser(false);}} className="flex items-center gap-2">
-                    <input autoFocus className="border rounded-md px-2 py-1 text-sm" placeholder="Your name" value={userName} onChange={(e)=>setUserName(e.target.value)} />
-                    <button className="text-sm px-3 py-1.5 rounded-lg border bg-emerald-50 hover:bg-emerald-100" type="submit">Save</button>
+                  <form onSubmit={(e)=>{e.preventDefault(); setIsEditingUser(false);}} className="flex items-center gap-2 w-full sm:w-auto">
+                    <input autoFocus className="tap border rounded-md px-2 py-1 text-sm w-full" placeholder="Your name" value={userName} onChange={(e)=>setUserName(e.target.value)} />
+                    <button className="tap text-sm px-3 py-1.5 rounded-lg border bg-emerald-50 hover:bg-emerald-100" type="submit">Save</button>
                   </form>
                 ) : (
-                  <div className="flex items-center gap-2 text-sm">
+                  <div className="flex items-center gap-2 text-sm w-full sm:w-auto justify-between sm:justify-end">
                     <span className="text-gray-600">Signed in as <b>{userName || '—'}</b></span>
-                    <button onClick={()=>setIsEditingUser(true)} className="px-2 py-1 rounded-md border hover:bg-gray-50">Change</button>
+                    <button onClick={()=>setIsEditingUser(true)} className="tap px-2 py-1 rounded-md border hover:bg-gray-50">Change</button>
                   </div>
                 )}
               </div>
@@ -396,20 +437,21 @@
                 onSelect={setSelectedId}
                 onDelete={requestDelete}
                 title={title}
+                description={description}
                 startDate={startDate}
                 endDate={endDate}
-                allTime={allTime}
                 startHour={startHour}
+                endHour={endHour}
                 setTitle={setTitle}
+                setDescription={setDescription}
                 setStartDate={val=>{ setStartDate(val); if(!endTouched) setEndDate(val); }}
                 setEndDate={val=>{ setEndDate(val); setEndTouched(true); }}
-                setAllTime={setAllTime}
                 setStartHour={setStartHour}
+                setEndHour={setEndHour}
                 mode={mode}
                 setMode={setMode}
                 onCreate={createEvent}
                 summaryForEvent={summaryForEvent}
-                uid={uid}
                 canAct={canAct}
               />
             ) : (
@@ -419,8 +461,8 @@
                 dayGroups={dayGroups}
                 yourVotes={yourVotes}
                 best={best}
-                currentFixedValue={currentFixedValue}
-                currentPollValue={currentPollValue}
+                currentFixedValue={()=>yourVotes.get(`fixed::${normalizeName(userName)}`)}
+                currentPollValue={(slotId)=>yourVotes.get(`${normalizeName(userName)}::${slotId}`)}
                 setVote={(val, meta)=>setVoteForEvent(selected.id, val, meta)}
                 openHover={openHover}
                 closeHover={closeHover}
@@ -435,7 +477,14 @@
         );
       }
 
-      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent, uid, canAct}){
+      function EventList(props){
+        const {
+          tz, events, onSelect, onDelete, title, description, startDate, endDate,
+          startHour, endHour, setTitle, setDescription, setStartDate, setEndDate,
+          setStartHour, setEndHour, mode, setMode, onCreate, summaryForEvent,
+          canAct
+        } = props;
+
         return (
           <div className="space-y-8">
             <section className="bg-white rounded-2xl shadow p-4">
@@ -444,18 +493,18 @@
                 <ul className="divide-y">
                   {events.map(ev => {
                     const summary = summaryForEvent(ev);
-                    const canDelete = !ev.createdBy || (uid && ev.createdBy === uid);
+                    const timeLabel = summary.timeLabel || `${labelHour(ev.startHour ?? 8)}–${labelHour(ev.endHour ?? 24)}`;
                     return (
-                      <li key={ev.id} className="py-3 flex items-center justify-between">
+                      <li key={ev.id} className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                         <div className="text-sm">
-                          <div className="font-medium flex items-center gap-2">
+                          <div className="font-medium flex items-center gap-2 flex-wrap">
                             {ev.title}
                             <span className={"text-[10px] px-1.5 py-0.5 rounded border " + (ev.mode==='poll'?'bg-blue-50 border-blue-300 text-blue-700':'bg-purple-50 border-purple-300 text-purple-700')}>
                               {ev.mode==='poll'?'Find a time':'Fixed'}
                             </span>
                           </div>
-                          <div className="text-gray-500">Hosted by: <b>{ev.organizer || '—'}</b></div>
-                          <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} {ev.allTime ? '· All time' : `· ${labelHour(ev.startHour ?? 8)}–midnight`}</div>
+                          {ev.description ? <div className="text-[12px] text-gray-600 mt-0.5">{ev.description}</div> : null}
+                          <div className="text-gray-500">{fmtDate(ev.startDate, tz)} → {fmtDate(ev.endDate, tz)} · {timeLabel}</div>
 
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
@@ -463,16 +512,14 @@
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
                             <div className="text:[12px] mt-1">
-                              <b>Top candidate:</b> {fmtDate(summary.best.start, tz)} · {fmtTime(summary.best.start, tz)} ·
+                              <b>Top candidate:</b> {fmtDate(summary.best.startMs, tz)} · {fmtTime(summary.best.startMs, tz)} ·
                               <span className="ml-1">Supporters: {summary.best.supporters}</span>
                             </div>
                           ) : null}
                         </div>
                         <div className="flex items-center gap-2">
-                          <button onClick={()=>onSelect(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
-                          {canDelete && (
-                            <button onClick={()=>onDelete(ev)} className="text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
-                          )}
+                          <button onClick={()=>onSelect(ev.id)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
+                          <button onClick={()=>onDelete(ev)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
                         </div>
                       </li>
                     );
@@ -485,41 +532,50 @@
 
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Create a new event</h2>
-              <form onSubmit={onCreate} className="grid gap-3 sm:grid-cols-6 items-end">
-                <label className="flex flex-col gap-1">
+              <form onSubmit={onCreate} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end w-full">
+                <label className="flex flex-col gap-1 sm:col-span-6">
                   <span className="text-sm text-gray-700">Event name</span>
-                  <input className="border rounded-md px-2 py-1 text-sm" value={title} onChange={e=>setTitle(e.target.value)} placeholder="Brunch / Study session / ..." required/>
+                  <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={title} onChange={e=>setTitle(e.target.value)} placeholder="Brunch / Study session / ..." required/>
                 </label>
-                <label className="flex flex-col gap-1">
+                <label className="flex flex-col gap-1 sm:col-span-6">
+                  <span className="text-sm text-gray-700">Description (optional)</span>
+                  <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={description} onChange={e=>setDescription(e.target.value)} placeholder="Short note e.g. location, budget, vibe"/>
+                </label>
+
+                <label className="flex flex-col gap-1 sm:col-span-4">
                   <span className="text-sm text-gray-700">Start date</span>
-                  <input type="date" className="border rounded-md px-2 py-1 text-sm" value={startDate} onChange={e=>setStartDate(e.target.value)} required/>
+                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startDate} onChange={e=>handleStartDateChange(e.target.value)} required/>
                 </label>
-                <label className="flex flex-col gap-1">
+                <label className="flex flex-col gap-1 sm:col-span-4">
                   <span className="text-sm text-gray-700">End date</span>
-                  <input type="date" className="border rounded-md px-2 py-1 text-sm" value={endDate} onChange={e=>setEndDate(e.target.value)} required/>
+                  <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endDate} onChange={e=>handleEndDateChange(e.target.value)} required/>
                 </label>
-                <label className="flex items-center gap-2 col-span-2 sm:col-span-2">
+
+                <label className="flex flex-col gap-1 sm:col-span-2">
+                  <span className="text-sm text-gray-700">Start time</span>
+                  <select className="tap border rounded-md px-2 py-1 text-sm w-full" value={startHour} onChange={e=>setStartHour(parseInt(e.target.value))}>
+                    {Array.from({length:24},(_,h)=>h).map(h=><option key={h} value={h}>{labelHour(h)}</option>)}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 sm:col-span-2">
+                  <span className="text-sm text-gray-700">End time</span>
+                  <select className="tap border rounded-md px-2 py-1 text-sm w-full" value={endHour} onChange={e=>setEndHour(parseInt(e.target.value))}>
+                    {Array.from({length:25},(_,h)=>h).map(h=><option key={h} value={h}>{labelHour(h)}</option>)}
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1 sm:col-span-4">
                   <span className="text-sm text-gray-700">Event type</span>
-                  <select className="border rounded-md px-2 py-1 text-sm" value={mode} onChange={e=>setMode(e.target.value)}>
+                  <select className="tap border rounded-md px-2 py-1 text-sm w-full" value={mode} onChange={e=>setMode(e.target.value)}>
                     <option value="poll">Find a time (confirm when people are free)</option>
                     <option value="fixed">Fixed date (collect RSVPs)</option>
                   </select>
                 </label>
-                <label className="flex items-center gap-2 col-span-2 sm:col-span-1">
-                  <input type="checkbox" checked={allTime} onChange={e=>setAllTime(e.target.checked)}/>
-                  <span className="text-sm text-gray-700">All time (24h)</span>
-                </label>
-                <label className="flex flex-col gap-1 col-span-2 sm:col-span-1">
-                  <span className="text-sm text-gray-700">Start time</span>
-                  <select className="border rounded-md px-2 py-1 text-sm" value={startHour} onChange={e=>setStartHour(parseInt(e.target.value))} disabled={allTime}>
-                    {Array.from({length:24},(_,h)=>h).map(h=><option key={h} value={h}>{labelHour(h)}</option>)}
-                  </select>
-                </label>
-                <div className="flex items-end">
-                  <button type="submit" disabled={!canAct} className={"text-sm px-3 py-2 rounded-lg border " + (canAct? "bg-emerald-50 hover:bg-emerald-100":"opacity-50 cursor-not-allowed")}>Create event</button>
+
+                <div className="flex items-end sm:col-span-12">
+                  <button type="submit" disabled={!canAct} className={"tap text-sm px-3 py-2 rounded-lg border " + (canAct? "bg-emerald-50 hover:bg-emerald-100":"opacity-50 cursor-not-allowed")}>Create event</button>
                 </div>
               </form>
-              <div className="mt-2 text-xs text-gray-500">For <b>Fixed</b> events, the host is auto‑RSVPed <b>Yes</b>. End date auto‑follows start date until you edit it.</div>
             </section>
           </div>
         );
@@ -527,20 +583,37 @@
 
       function EventDetail({ tz, event, dayGroups, yourVotes, best, currentFixedValue, currentPollValue, setVote, openHover, closeHover, namesBySlot, canAct, onBack }){
         const isFixed = event.mode === 'fixed';
+        const timeLabel = `${labelHour(event.startHour ?? 8)}–${labelHour(event.endHour ?? 24)}`;
+
+        // Helper for rendering name list with "+N more"
+        function NameList({ names, max=6 }){
+          const shown = names.slice(0, max);
+          const extra = Math.max(0, names.length - shown.length);
+          return <span>{shown.join(', ')}{extra ? ` +${extra} more` : ''}</span>;
+        }
+
+        // Build the names for the best slot (yes+maybe)
+        let bestNames = [];
+        if (best && namesBySlot) {
+          const bucket = namesBySlot.get(best.id) || { yes:[], maybe:[], no:[] };
+          bestNames = [...(bucket.yes||[]), ...(bucket.maybe||[])];
+        }
+
         return (
           <div className="space-y-6">
-            <section className="bg-white rounded-2xl shadow p-4 flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-semibold flex items-center gap-2">
+            <section className="bg-white rounded-2xl shadow p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="text-lg font-semibold flex items-center gap-2 flex-wrap">
                   {event.title}
                   <span className={"text-[10px] px-1.5 py-0.5 rounded border " + (isFixed?'bg-purple-50 border-purple-300 text-purple-700':'bg-blue-50 border-blue-300 text-blue-700')}>
                     {isFixed?'Fixed':'Find a time'}
                   </span>
                 </h2>
+                {event.description ? <div className="text-[12px] text-gray-600 mt-0.5">{event.description}</div> : null}
+                <div className="text-xs text-gray-500">Dates: <b>{fmtDate(event.startDate, tz)}</b> → <b>{fmtDate(event.endDate, tz)}</b> · {timeLabel}</div>
                 <div className="text-xs text-gray-500">Hosted by: <b>{event.organizer || '—'}</b></div>
-                <div className="text-xs text-gray-500">Dates: <b>{fmtDate(event.startDate, tz)}</b> → <b>{fmtDate(event.endDate, tz)}</b> · {event.allTime ? 'All time' : `${labelHour(event.startHour ?? 8)}–midnight`}</div>
               </div>
-              <button onClick={onBack} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">← Back</button>
+              <button onClick={onBack} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">← Back</button>
             </section>
 
             {isFixed ? (
@@ -558,12 +631,12 @@
                   <div className="space-y-6">
                     {dayGroups.map(g => (
                       <div key={g.dayKey}>
-                        <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
-                        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+                        <div className="text-sm font-semibold mb-2">{fmtDate(g.dayStartMs, tz)}</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))' }}>
                           {g.slots.map(s => (
                             <div key={s.id} className="border rounded-lg p-2" onMouseEnter={(e)=>openHover(e, s.id)} onMouseLeave={closeHover}>
                               <div className="flex items-center justify-between gap-2">
-                                <div className="text-[12px] text-gray-700">{fmtTime(s.start, tz)}</div>
+                                <div className="text-[12px] text-gray-700">{fmtTime(s.startMs, tz)}</div>
                                 <SegmentedVote value={currentPollValue(s.id)} onChange={(v)=>setVote(v, { type:'poll', slotId: s.id })} disabled={!canAct} />
                               </div>
                             </div>
@@ -580,11 +653,21 @@
               <section className="bg-white rounded-2xl shadow p-4">
                 <h3 className="text-lg font-semibold mb-2">Top candidate</h3>
                 {best ? (
-                  <div className="flex flex-wrap items-center gap-3 text-sm">
-                    <span>Time:</span>
-                    <Pill>{fmtDate(best.start, tz)} · {fmtTime(best.start, tz)}</Pill>
-                    <span>Supporters:</span>
-                    <Pill>{best.supporters}</Pill>
+                  <div className="flex flex-col gap-1 text-sm">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>Time:</span>
+                      <Pill>{fmtDate(best.startMs, tz)} · {fmtTime(best.startMs, tz)}</Pill>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>Supporters:</span>
+                      {(() => {
+                        const bucket = namesBySlot.get(best.id) || { yes:[], maybe:[], no:[] };
+                        const names = [...(bucket.yes||[]), ...(bucket.maybe||[])];
+                        const shown = names.slice(0, 6).join(', ');
+                        const extra = Math.max(0, names.length - 6);
+                        return <Pill>{shown}{extra ? ` +${extra} more` : ''} {names.length ? `(${names.length})` : '(0)'}</Pill>;
+                      })()}
+                    </div>
                   </div>
                 ) : (
                   <div className="text-sm text-gray-600">Cast some votes to see the best time.</div>
