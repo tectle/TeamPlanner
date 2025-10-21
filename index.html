@@ -432,7 +432,48 @@
               </div>
             )}
 
-            {!selected ? (
+           
+            {editTarget && (
+              <section className="bg-white rounded-2xl shadow p-4 mt-4">
+                <h2 className="text-lg font-semibold mb-3">Edit event</h2>
+                <form onSubmit={(e)=>{e.preventDefault();
+                  const updated = { title, description, startDate, endDate, startHour, endHour, mode };
+                  if (db) { setDoc(doc(db, "team_events", editTarget.id), updated, { merge: true }); }
+                  else { setEvents(prev => prev.map(ev => ev.id===editTarget.id ? { ...ev, ...updated } : ev)); }
+                  setEditTarget(null);
+                }} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end w-full">
+                  <label className="flex flex-col gap-1 sm:col-span-6">
+                    <span className="text-sm text-gray-700">Event name</span>
+                    <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={title} onChange={e=>setTitle(e.target.value)} required/>
+                  </label>
+                  <label className="flex flex-col gap-1 sm:col-span-6">
+                    <span className="text-sm text-gray-700">Description (optional)</span>
+                    <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={description} onChange={e=>setDescription(e.target.value)} />
+                  </label>
+                  <label className="flex flex-col gap-1 sm:col-span-3">
+                    <span className="text-sm text-gray-700">Start date</span>
+                    <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startDate} onChange={e=>setStartDate(e.target.value)} />
+                  </label>
+                  <label className="flex flex-col gap-1 sm:col-span-3">
+                    <span className="text-sm text-gray-700">End date</span>
+                    <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endDate} onChange={e=>setEndDate(e.target.value)} />
+                  </label>
+                  <label className="flex flex-col gap-1 sm:col-span-3">
+                    <span className="text-sm text-gray-700">Start hour</span>
+                    <input type="number" min="0" max="23" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startHour} onChange={e=>setStartHour(parseInt(e.target.value||'0',10))} />
+                  </label>
+                  <label className="flex flex-col gap-1 sm:col-span-3">
+                    <span className="text-sm text-gray-700">End hour</span>
+                    <input type="number" min="1" max="24" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endHour} onChange={e=>setEndHour(parseInt(e.target.value||'0',10))} />
+                  </label>
+                  <div className="sm:col-span-12 flex items-center gap-2">
+                    <button type="submit" className="tap text-sm px-3 py-1.5 rounded-lg border bg-blue-50 text-blue-700 hover:bg-blue-100">Save</button>
+                    <button type="button" onClick={()=>setEditTarget(null)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Cancel</button>
+                  </div>
+                </form>
+              </section>
+            )}
+ {!selected ? (
               <EventList
                 tz={tz}
                 events={events}
@@ -711,46 +752,6 @@
 
       const root = ReactDOM.createRoot(document.getElementById('root'));
       
-      {editTarget && (
-        <section className="bg-white rounded-2xl shadow p-4 mt-4">
-          <h2 className="text-lg font-semibold mb-3">Edit event</h2>
-          <form onSubmit={(e)=>{e.preventDefault();
-            const updated = { title, description, startDate, endDate, startHour, endHour, mode };
-            if (db) { setDoc(doc(db, "team_events", editTarget.id), updated, { merge: true }); }
-            else { setEvents(prev => prev.map(ev => ev.id===editTarget.id ? { ...ev, ...updated } : ev)); }
-            setEditTarget(null);
-          }} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end w-full">
-            <label className="flex flex-col gap-1 sm:col-span-6">
-              <span className="text-sm text-gray-700">Event name</span>
-              <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={title} onChange={e=>setTitle(e.target.value)} required/>
-            </label>
-            <label className="flex flex-col gap-1 sm:col-span-6">
-              <span className="text-sm text-gray-700">Description (optional)</span>
-              <input className="tap border rounded-md px-2 py-1 text-sm w-full" value={description} onChange={e=>setDescription(e.target.value)} />
-            </label>
-            <label className="flex flex-col gap-1 sm:col-span-3">
-              <span className="text-sm text-gray-700">Start date</span>
-              <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startDate} onChange={e=>setStartDate(e.target.value)} />
-            </label>
-            <label className="flex flex-col gap-1 sm:col-span-3">
-              <span className="text-sm text-gray-700">End date</span>
-              <input type="date" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endDate} onChange={e=>setEndDate(e.target.value)} />
-            </label>
-            <label className="flex flex-col gap-1 sm:col-span-3">
-              <span className="text-sm text-gray-700">Start hour</span>
-              <input type="number" min="0" max="23" className="tap border rounded-md px-2 py-1 text-sm w-full" value={startHour} onChange={e=>setStartHour(parseInt(e.target.value||'0',10))} />
-            </label>
-            <label className="flex flex-col gap-1 sm:col-span-3">
-              <span className="text-sm text-gray-700">End hour</span>
-              <input type="number" min="1" max="24" className="tap border rounded-md px-2 py-1 text-sm w-full" value={endHour} onChange={e=>setEndHour(parseInt(e.target.value||'0',10))} />
-            </label>
-            <div className="sm:col-span-12 flex items-center gap-2">
-              <button type="submit" className="tap text-sm px-3 py-1.5 rounded-lg border bg-blue-50 text-blue-700 hover:bg-blue-100">Save</button>
-              <button type="button" onClick={()=>setEditTarget(null)} className="tap text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Cancel</button>
-            </div>
-          </form>
-        </section>
-      )}
 root.render(React.createElement(App));
     </script>
   </body>
