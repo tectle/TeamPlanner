@@ -1,9 +1,10 @@
+
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Team — Plan Picker (Realtime + Modular SDK)</title>
+    <title>Team — Plan Picker (Name‑keyed votes)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
@@ -13,11 +14,13 @@
   <body>
     <div id="root"></div>
 
+    <!-- Firebase (Modular v12) -->
     <script type="module">
       import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
       import { getFirestore, collection, addDoc, doc, setDoc, onSnapshot, query, orderBy, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
       import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
 
+      // Replace with your Firebase config (yours was already provided earlier)
       const firebaseConfig = {
         apiKey: "AIzaSyCrgMr4JyvEunCIdVTmIBpkRan8tkhGefI",
         authDomain: "teamtectle.firebaseapp.com",
@@ -41,10 +44,12 @@
     <script type="text/babel" data-presets="env,react">
       const { useMemo, useState, useEffect } = React;
 
-      const LS_KEY = "teamPlanner:fallback:v3";
+      const LS_KEY = "teamPlanner:nameKeyed:v1";
       const saveToLS = (obj)=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(obj)); }catch(e){} };
       const loadFromLS = ()=>{ try{ const raw=localStorage.getItem(LS_KEY); return raw? JSON.parse(raw): null; }catch(e){return null;} };
 
+      // utils
+      const normalizeName = (s)=> (s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
       const MS = 60 * 1000;
       const fmtDate = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,weekday:"short",month:"short",day:"numeric"}).format(new Date(d));
       const fmtTime = (d, tz) => new Intl.DateTimeFormat(undefined,{timeZone:tz,hour:"numeric",minute:"2-digit"}).format(new Date(d));
@@ -77,17 +82,31 @@
         return scored[0];
       }
 
-      const pollVoteDocId = (uid, slotId) => `${uid}::${slotId}`;
-      const fixedVoteDocId = (uid) => `fixed::${uid}`;
-
       function Pill({children}){ return <span className="px-2 py-0.5 rounded-full text-xs border">{children}</span>; }
-      function SegmentedVote({value, onChange}){
-        const base="text-[11px] px-1.5 py-0.5 rounded-md border hover:bg-gray-50";
+      function SegmentedVote({value, onChange, disabled}){
+        const base="text-[11px] px-1.5 py-0.5 rounded-md border " + (disabled ? "opacity-50 cursor-not-allowed" : "hover:bg-gray-50");
         return (<div className="inline-flex gap-1">
-          <button type="button" className={base + (value==='yes'?' bg-green-100 border-green-300':'')} onClick={()=>onChange('yes')}>Yes</button>
-          <button type="button" className={base + (value==='maybe'?' bg-yellow-100 border-yellow-300':'')} onClick={()=>onChange('maybe')}>Maybe</button>
-          <button type="button" className={base + (value==='no'?' bg-red-100 border-red-300':'')} onClick={()=>onChange('no')}>No</button>
+          <button type="button" className={base + (value==='yes'?' bg-green-100 border-green-300':'')} onClick={()=>!disabled && onChange('yes')}>Yes</button>
+          <button type="button" className={base + (value==='maybe'?' bg-yellow-100 border-yellow-300':'')} onClick={()=>!disabled && onChange('maybe')}>Maybe</button>
+          <button type="button" className={base + (value==='no'?' bg-red-100 border-red-300':'')} onClick={()=>!disabled && onChange('no')}>No</button>
         </div>);
+      }
+
+      function HoverCard({ visible, anchorRect, names }){
+        if (!visible || !anchorRect) return null;
+        const style = { position: 'fixed', top: anchorRect.bottom + 6, left: Math.min(anchorRect.left, window.innerWidth - 260), width: 240, zIndex: 50 };
+        return (
+          <div style={style} className="bg-white border shadow-lg rounded-xl p-3 text-xs">
+            <div className="space-y-1">
+              <div><b>Yes</b> {names.yes.length ? `(${names.yes.length})` : ''}</div>
+              <div className="text-gray-600">{names.yes.join(', ') || '—'}</div>
+              <div className="mt-2"><b>Maybe</b> {names.maybe.length ? `(${names.maybe.length})` : ''}</div>
+              <div className="text-gray-600">{names.maybe.join(', ') || '—'}</div>
+              <div className="mt-2"><b>No</b> {names.no.length ? `(${names.no.length})` : ''}</div>
+              <div className="text-gray-600">{names.no.join(', ') || '—'}</div>
+            </div>
+          </div>
+        );
       }
 
       function App(){
@@ -118,6 +137,11 @@
         const [selectedId,setSelectedId]=useState(null);
         const [yourVotes,setYourVotes]=useState(new Map());
 
+        const [namesBySlot,setNamesBySlot]=useState(new Map()); // slotId -> {yes:[], maybe:[], no:[]}
+        const [attendingMap,setAttendingMap]=useState({}); // eventId -> { yes, namesYes }
+        const [hoverState,setHoverState]=useState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} });
+
+        // auth boot (still use anonymous to write; but vote identity is by nameKey)
         useEffect(()=>{
           if (auth) {
             const unsub = onAuthStateChanged(auth, async (u) => {
@@ -132,7 +156,7 @@
             const saved = loadFromLS();
             if(saved){
               setUserName(saved.userName || '');
-              setIsEditingUser(!saved.userName);
+              setIsEditingUser(!(saved.userName && saved.userName.trim()));
               setEvents(saved.events || []);
               setSelectedId(saved.selectedId || null);
               setYourVotes(new Map(saved.votes || []));
@@ -140,12 +164,14 @@
           }
         },[]);
 
+        // local fallback persist
         useEffect(()=>{
           if(auth) return;
           const toStore = { userName, selectedId, events, votes: Array.from(yourVotes.entries()) };
           saveToLS(toStore);
         },[userName, selectedId, events, yourVotes, auth]);
 
+        // events
         useEffect(()=>{
           if(!db) return;
           const q = query(collection(db, "team_events"), orderBy("createdAt","asc"));
@@ -156,16 +182,49 @@
           return unsub;
         },[db]);
 
+        // per-event votes for attending list
+        useEffect(()=>{
+          if(!db) return;
+          const unsubs = [];
+          events.forEach(ev => {
+            const votesRef = collection(doc(db, "team_events", ev.id), "votes");
+            const u = onSnapshot(votesRef, (snap)=>{
+              let yes=0; const namesYes=[];
+              snap.forEach(s=>{
+                const v = s.data();
+                if (s.id.startsWith("fixed::") && v.value === 'yes') {
+                  yes += 1;
+                  namesYes.push(v.userName || 'Anonymous');
+                }
+              });
+              setAttendingMap(prev => ({ ...prev, [ev.id]: { yes, namesYes } }));
+            });
+            unsubs.push(u);
+          });
+          return ()=> unsubs.forEach(fn => fn && fn());
+        },[db, events]);
+
+        // selected event votes (names-by-slot + current values)
         useEffect(()=>{
           if(!db || !selectedId) return;
           const votesRef = collection(doc(db, "team_events", selectedId), "votes");
           const unsub = onSnapshot(votesRef, (snap)=>{
-            const map = new Map();
+            const mapValues = new Map();
+            const mapNames = new Map();
             snap.forEach(docSnap => {
-              const v = docSnap.data();
-              map.set(docSnap.id, v.value);
+              const v = docSnap.data(); // { value, userName, slotId }
+              mapValues.set(docSnap.id, v.value);
+              if (v.slotId) {
+                const bucket = mapNames.get(v.slotId) || { yes:[], maybe:[], no:[] };
+                const nm = v.userName || 'Anonymous';
+                if (v.value === 'yes') bucket.yes.push(nm);
+                else if (v.value === 'maybe') bucket.maybe.push(nm);
+                else if (v.value === 'no') bucket.no.push(nm);
+                mapNames.set(v.slotId, bucket);
+              }
             });
-            setYourVotes(map);
+            setYourVotes(mapValues);
+            setNamesBySlot(mapNames);
           });
           return ()=>unsub && unsub();
         },[db, selectedId]);
@@ -175,25 +234,29 @@
         function handleStartDateChange(val){ setStartDate(val); if(!endTouched) setEndDate(val); }
         function handleEndDateChange(val){ setEndDate(val); setEndTouched(true); }
 
+        const nameKey = normalizeName(userName);
+        const canAct = !!nameKey; // disable inputs until name saved
+
         async function createEvent(e){
           e.preventDefault();
           if(!title.trim()) return;
+          if(!canAct){ alert("Please set your name first."); return; }
           const start=new Date(startDate), end=new Date(endDate);
           if(start>end){ alert('Start date must be before end date.'); return; }
-          const ev={ title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName || 'You', mode, createdAt: new Date().toISOString() };
+          const ev={ title: title.trim(), timezone: tz, startDate, endDate, allTime, startHour, organizer: userName.trim(), mode, createdAt: new Date().toISOString(), createdBy: (uid || null) };
 
           if(db){
             const docRef = await addDoc(collection(db, "team_events"), ev);
-            if(mode==='fixed' && uid){
+            if(mode==='fixed' && nameKey){
               const votesRef = collection(doc(db, "team_events", docRef.id), "votes");
-              await setDoc(doc(votesRef, `fixed::${uid}`), { value:'yes', uid, userName: userName || 'You', createdAt: new Date().toISOString() });
+              await setDoc(doc(votesRef, `fixed::${nameKey}`), { value:'yes', userName: userName.trim(), slotId: null, updatedAt: new Date().toISOString() });
             }
           }else{
             const id = Math.random().toString(36).slice(2);
             const newEv = { id, ...ev };
             setEvents(p=>[...p, newEv]);
             if(mode==='fixed'){
-              setYourVotes(p=> new Map(p).set(`fixed::local`, 'yes'));
+              setYourVotes(p=> new Map(p).set(`fixed::${nameKey}`, 'yes'));
             }
           }
 
@@ -201,32 +264,39 @@
         }
 
         async function setVoteForEvent(evId, value, meta){
-          if(db && uid){
+          if(!canAct){ alert("Please set your name first."); return; }
+          if(db){
             const votesRef = collection(doc(db, "team_events", evId), "votes");
-            const docId = (meta.type==='fixed') ? `fixed::${uid}` : `${uid}::${meta.slotId}`;
-            await setDoc(doc(votesRef, docId), { value, uid, userName: userName || 'You', slotId: meta.slotId || null, updatedAt: new Date().toISOString() });
+            const docId = (meta.type==='fixed') ? `fixed::${nameKey}` : `${nameKey}::${meta.slotId}`;
+            await setDoc(doc(votesRef, docId), { value, userName: userName.trim(), slotId: meta.slotId || null, updatedAt: new Date().toISOString() });
           }else{
-            const key = (meta.type==='fixed') ? `fixed::local` : `local::${meta.slotId}`;
+            const key = (meta.type==='fixed') ? `fixed::${nameKey}` : `${nameKey}::${meta.slotId}`;
             setYourVotes(p=> new Map(p).set(key, value));
           }
         }
 
-        async function requestDelete(evId){
+        async function requestDelete(ev){
           if(!confirm("Delete this event?")) return;
           if(db){
-            const votesRef = collection(doc(db, "team_events", evId), "votes");
-            const snap = await getDocs(votesRef);
-            const ops = [];
-            snap.forEach(d => ops.push(deleteDoc(d.ref)));
-            await Promise.all(ops);
-            await deleteDoc(doc(db, "team_events", evId));
-          }else{
-            setEvents(p=>p.filter(e=>e.id!==evId));
-            setYourVotes(new Map());
-            if(selectedId===evId) setSelectedId(null);
+            try {
+              if (ev.createdBy && uid !== ev.createdBy) {
+                alert("Only the event host can delete this event.");
+                return;
+              }
+              const votesRef = collection(doc(db, "team_events", ev.id), "votes");
+              const snap = await getDocs(votesRef);
+              const ops = [];
+              snap.forEach(d => ops.push(deleteDoc(d.ref)));
+              await Promise.all(ops);
+              await deleteDoc(doc(db, "team_events", ev.id));
+            } catch (e) {
+              console.error(e);
+              alert("Delete failed. Check Firestore rules to allow hosts to delete their own events.");
+            }
           }
         }
 
+        // build grid
         const dayGroups = useMemo(()=>{
           if(!selected || selected.mode==='fixed') return [];
           const sHour = selected.allTime?0:(selected.startHour ?? 8);
@@ -238,43 +308,50 @@
           const map = new Map();
           allSlots.forEach(s=>map.set(s.id, []));
           if(selected){
-            yourVotes.forEach((v, docId)=>{
-              const parts = docId.split("::");
-              if(parts.length===2){
-                const slotId = parts[1];
-                if(map.has(slotId)){
-                  const arr = map.get(slotId); arr.push({slotId, participantName:'You', value:v}); map.set(slotId, arr);
-                }
-              }
+            namesBySlot.forEach((bucket, slotId)=>{
+              const arr = [];
+              bucket.yes.forEach(n => arr.push({slotId, participantName:n, value:'yes'}));
+              bucket.maybe.forEach(n => arr.push({slotId, participantName:n, value:'maybe'}));
+              bucket.no.forEach(n => arr.push({slotId, participantName:n, value:'no'}));
+              map.set(slotId, arr);
             });
           }
           return map;
-        },[allSlots, yourVotes, selected]);
+        },[allSlots, namesBySlot, selected]);
 
         const best = useMemo(()=> pickBestSlot(allSlots, availsBySlot), [allSlots, availsBySlot]);
 
-        function currentFixedValue(){ return yourVotes.get(`fixed::${uid || 'local'}`); }
-        function currentPollValue(slotId){ return yourVotes.get(`${uid || 'local'}::${slotId}`); }
+        function currentFixedValue(){ return yourVotes.get(`fixed::${nameKey}`); }
+        function currentPollValue(slotId){ return yourVotes.get(`${nameKey}::${slotId}`); }
+
+        function openHover(e, slotId){
+          const rect = e.currentTarget.getBoundingClientRect();
+          const bucket = namesBySlot.get(slotId) || { yes:[], maybe:[], no:[] };
+          setHoverState({ visible:true, rect, names: bucket });
+        }
+        function closeHover(){ setHoverState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} }); }
 
         function summaryForEvent(ev){
+          const att = attendingMap[ev.id];
           if(ev.mode==='fixed'){
-            if(db) return { type:'fixed', yes: '-', names: [] };
-            let yes=0;
-            Array.from(yourVotes.entries()).forEach(([k,v])=>{ if(k.startsWith("fixed::") && v==='yes') yes+=1; });
-            return { type:'fixed', yes, names: yes? ['You']:[] };
+            if(att) {
+              const names = att.namesYes || [];
+              const first = names.slice(0,5).join(', ');
+              const extra = Math.max(0, (names.length - 5));
+              return { type:'fixed', yes: att.yes, label: first + (extra? ` +${extra} more`: '') };
+            }
+            return { type:'fixed', yes: 0, label: '' };
           } else {
             const sHour = ev.allTime?0:(ev.startHour ?? 8);
             const slots = generateDailyHourRangeSlots(ev.startDate, ev.endDate, sHour, 24).flatMap(g=>g.slots);
             const map = new Map();
             slots.forEach(s=>map.set(s.id, []));
-            yourVotes.forEach((v, docId)=>{
-              const parts = docId.split("::");
-              if(parts.length===2){
-                const slotId = parts[1];
-                if(map.has(slotId)){
-                  const arr = map.get(slotId); arr.push({slotId, participantName:'You', value:v}); map.set(slotId, arr);
-                }
-              }
+            namesBySlot.forEach((bucket, slotId)=>{
+              const arr = [];
+              bucket.yes.forEach(n => arr.push({slotId, participantName:n, value:'yes'}));
+              bucket.maybe.forEach(n => arr.push({slotId, participantName:n, value:'maybe'}));
+              bucket.no.forEach(n => arr.push({slotId, participantName:n, value:'no'}));
+              map.set(slotId, arr);
             });
             const b = pickBestSlot(slots, map);
             return { type:'poll', best: b };
@@ -293,12 +370,18 @@
                   </form>
                 ) : (
                   <div className="flex items-center gap-2 text-sm">
-                    <span className="text-gray-600">Signed in as <b>{userName || 'You'}</b></span>
+                    <span className="text-gray-600">Signed in as <b>{userName || '—'}</b></span>
                     <button onClick={()=>setIsEditingUser(true)} className="px-2 py-1 rounded-md border hover:bg-gray-50">Change</button>
                   </div>
                 )}
               </div>
             </header>
+
+            {!canAct && (
+              <div className="p-3 rounded-xl border bg-yellow-50 text-sm mb-4">
+                Please set your <b>name</b> (top‑right) to create events or vote.
+              </div>
+            )}
 
             {!db && (
               <div className="p-3 rounded-xl border bg-yellow-50 text-sm mb-4">
@@ -326,7 +409,8 @@
                 setMode={setMode}
                 onCreate={createEvent}
                 summaryForEvent={summaryForEvent}
-                dbEnabled={!!db}
+                uid={uid}
+                canAct={canAct}
               />
             ) : (
               <EventDetail
@@ -338,14 +422,20 @@
                 currentFixedValue={currentFixedValue}
                 currentPollValue={currentPollValue}
                 setVote={(val, meta)=>setVoteForEvent(selected.id, val, meta)}
+                openHover={openHover}
+                closeHover={closeHover}
+                namesBySlot={namesBySlot}
+                canAct={canAct}
                 onBack={()=>setSelectedId(null)}
               />
             )}
+
+            <HoverCard visible={hoverState.visible} anchorRect={hoverState.rect} names={hoverState.names} />
           </div>
         );
       }
 
-      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent, dbEnabled}){
+      function EventList({tz,events,onSelect,onDelete,title,startDate,endDate,allTime,startHour,setTitle,setStartDate,setEndDate,setAllTime,setStartHour,mode,setMode,onCreate, summaryForEvent, uid, canAct}){
         return (
           <div className="space-y-8">
             <section className="bg-white rounded-2xl shadow p-4">
@@ -354,6 +444,7 @@
                 <ul className="divide-y">
                   {events.map(ev => {
                     const summary = summaryForEvent(ev);
+                    const canDelete = !ev.createdBy || (uid && ev.createdBy === uid);
                     return (
                       <li key={ev.id} className="py-3 flex items-center justify-between">
                         <div className="text-sm">
@@ -368,7 +459,7 @@
 
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
-                              <b>Attending:</b> {summary.yes}{summary.yes==='-'?'':' ' + (summary.yes===1?'person':'people')}
+                              <b>Attending:</b> {summary.yes} {summary.yes===1?'person':'people'}{summary.label ? ` · ${summary.label}` : ''}
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
                             <div className="text:[12px] mt-1">
@@ -379,7 +470,9 @@
                         </div>
                         <div className="flex items-center gap-2">
                           <button onClick={()=>onSelect(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-gray-50 hover:bg-gray-100">Select</button>
-                          <button onClick={()=>onDelete(ev.id)} className="text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
+                          {canDelete && (
+                            <button onClick={()=>onDelete(ev)} className="text-sm px-3 py-1.5 rounded-lg border bg-red-50 text-red-700 hover:bg-red-100">Delete</button>
+                          )}
                         </div>
                       </li>
                     );
@@ -423,7 +516,7 @@
                   </select>
                 </label>
                 <div className="flex items-end">
-                  <button type="submit" className="text-sm px-3 py-2 rounded-lg border bg-emerald-50 hover:bg-emerald-100">Create event</button>
+                  <button type="submit" disabled={!canAct} className={"text-sm px-3 py-2 rounded-lg border " + (canAct? "bg-emerald-50 hover:bg-emerald-100":"opacity-50 cursor-not-allowed")}>Create event</button>
                 </div>
               </form>
               <div className="mt-2 text-xs text-gray-500">For <b>Fixed</b> events, the host is auto‑RSVPed <b>Yes</b>. End date auto‑follows start date until you edit it.</div>
@@ -432,7 +525,7 @@
         );
       }
 
-      function EventDetail({ tz, event, dayGroups, yourVotes, best, currentFixedValue, currentPollValue, setVote, onBack }){
+      function EventDetail({ tz, event, dayGroups, yourVotes, best, currentFixedValue, currentPollValue, setVote, openHover, closeHover, namesBySlot, canAct, onBack }){
         const isFixed = event.mode === 'fixed';
         return (
           <div className="space-y-6">
@@ -454,7 +547,7 @@
               <section className="bg-white rounded-2xl shadow p-4">
                 <div className="flex items-center justify-between">
                   <div className="text-sm">Will you attend?</div>
-                  <SegmentedVote value={currentFixedValue()} onChange={(v)=>setVote(v, { type:'fixed' })} />
+                  <SegmentedVote value={currentFixedValue()} onChange={(v)=>setVote(v, { type:'fixed' })} disabled={!canAct} />
                 </div>
               </section>
             ) : (
@@ -466,22 +559,15 @@
                     {dayGroups.map(g => (
                       <div key={g.dayKey}>
                         <div className="text-sm font-semibold mb-2">{fmtDate(g.dayISOStart, tz)}</div>
-                        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
-                          {g.slots.map(s => {
-                            const supporters = (yourVotes && yourVotes.size) ? 0 + [...yourVotes.entries()].filter(([k,v]) => {
-                              const parts = k.split("::"); // uid::slotId
-                              return parts.length===2 && parts[1]===s.id && (v==='yes' || v==='maybe');
-                            }).length : 0;
-                            return (
-                              <div key={s.id} className="border rounded-lg p-2">
-                                <div className="text-[11px] text-gray-600 mb-1 flex justify-between">
-                                  <span>{fmtTime(s.start, tz)}</span>
-                                  <span className="text-gray-500">Supporters: {supporters}</span>
-                                </div>
-                                <SegmentedVote value={currentPollValue(s.id)} onChange={(v)=>setVote(v, { type:'poll', slotId: s.id })} />
+                        <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+                          {g.slots.map(s => (
+                            <div key={s.id} className="border rounded-lg p-2" onMouseEnter={(e)=>openHover(e, s.id)} onMouseLeave={closeHover}>
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="text-[12px] text-gray-700">{fmtTime(s.start, tz)}</div>
+                                <SegmentedVote value={currentPollValue(s.id)} onChange={(v)=>setVote(v, { type:'poll', slotId: s.id })} disabled={!canAct} />
                               </div>
-                            );
-                          })}
+                            </div>
+                          ))}
                         </div>
                       </div>
                     ))}
