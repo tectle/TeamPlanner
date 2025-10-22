@@ -259,14 +259,14 @@
           events.forEach(ev => {
             const votesRef = collection(doc(db, "team_events", ev.id), "votes");
             const u = onSnapshot(votesRef, (snap)=>{
-              let yes=0, maybe=0, no=0; const namesYes=[];
+              let yes=0, maybe=0, no=0; const namesYes=[]; const namesMaybe=[]; const namesNo=[];
               const slotBuckets = new Map(); // slotId -> {yes[], maybe[], no[]}
               snap.forEach(s=>{
                 const v = s.data();
                 if (s.id.startsWith("fixed::")) {
                   if (v.value === 'yes') { yes += 1; namesYes.push(v.userName || 'Anonymous'); }
-                  else if (v.value === 'maybe') { maybe += 1; }
-                  else if (v.value === 'no') { no += 1; }
+                  else if (v.value === 'maybe') { maybe += 1; namesMaybe.push(v.userName || 'Anonymous'); }
+                  else if (v.value === 'no') { no += 1; namesNo.push(v.userName || 'Anonymous'); }
                 } else if (v.slotId) {
                   const b = slotBuckets.get(v.slotId) || { yes:[], maybe:[], no:[] };
                   const nm = v.userName || 'Anonymous';
@@ -277,7 +277,7 @@
                 }
               });
               // Fixed summaries
-              setAttendingMap(prev => ({ ...prev, [ev.id]: { yes, maybe, no, namesYes } }));
+              setAttendingMap(prev => ({ ...prev, [ev.id]: { yes, maybe, no, namesYes, namesMaybe, namesNo } }));
               // Poll best summaries (names for best slot)
               if (ev.mode === 'poll') {
                 const best = pickBestSlotFromBuckets(slotBuckets);
@@ -411,9 +411,16 @@
         function currentFixedValue(){ return yourVotes.get(`fixed::${normalizeName(userName)}`); }
         function currentPollValue(slotId){ return yourVotes.get(`${normalizeName(userName)}::${slotId}`); }
 
-        function openHover(e, slotId){
+        function openHover(e, slotIdOrNames){
           const rect = e.currentTarget.getBoundingClientRect();
-          const bucket = namesBySlotSelected.get(slotId) || { yes:[], maybe:[], no:[] };
+          let bucket;
+          if (typeof slotIdOrNames === 'string') {
+            bucket = namesBySlotSelected.get(slotIdOrNames) || { yes:[], maybe:[], no:[] };
+          } else if (slotIdOrNames && typeof slotIdOrNames === 'object') {
+            bucket = slotIdOrNames;
+          } else {
+            bucket = { yes:[], maybe:[], no:[] };
+          }
           setHoverState({ visible:true, rect, names: bucket });
         }
         function closeHover(){ setHoverState({ visible:false, rect:null, names:{yes:[], maybe:[], no:[]} }); }
@@ -588,7 +595,7 @@
 
                           {summary?.type==='fixed' ? (
                             <div className="text-[12px] mt-1">
-                              <b>Totals:</b> Yes {summary.yes} · Maybe {summary.maybe||0} · No {summary.no||0}{summary.label ? ` · ${summary.label}` : ''}
+                              <b>Totals:</b> Yes {summary.yes}{summary.label ? ` · ${summary.label}` : ''}
                             </div>
                           ) : summary?.type==='poll' && summary.best ? (
                             <div className="text-[12px] mt-1 flex flex-wrap items-center gap-1">
@@ -778,7 +785,19 @@ async function addComment(e) {
                   <SegmentedVote value={currentFixedValue()} onChange={(v)=>setVote(v, { type:'fixed' })} disabled={!canAct} />
                 </div>
                 <div className="mt-2 text-xs text-gray-700">
-                  <b>Totals:</b> Yes {(attendingMap?.[event.id]?.yes)||0} · Maybe {(attendingMap?.[event.id]?.maybe)||0} · No {(attendingMap?.[event.id]?.no)||0}
+                  <b>Totals:</b> Yes {(attendingMap?.[event.id]?.yes)||0}
+                  <span
+                    className="ml-2 inline-block px-2 py-0.5 border rounded-full cursor-default hover:bg-gray-50"
+                    onMouseEnter={(e)=>openHover(e, {
+                      yes: (attendingMap?.[event.id]?.namesYes)||[],
+                      maybe: (attendingMap?.[event.id]?.namesMaybe)||[],
+                      no: (attendingMap?.[event.id]?.namesNo)||[]
+                    })}
+                    onMouseLeave={closeHover}
+                    title="Hover to see Yes/Maybe/No names"
+                  >
+                    breakdown
+                  </span>
                 </div>
               </section>
             ) : (
